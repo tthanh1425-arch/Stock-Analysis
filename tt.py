@@ -1,16 +1,17 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import warnings
 import logging
+import os
+from pathlib import Path
 
 # Thêm hàm kiểm tra chế độ tối/sáng
 def is_dark_mode():
-     # Kiểm tra xem có session state cho theme không
+    # Kiểm tra xem có session state cho theme không
     if 'theme' in st.session_state:
         return st.session_state.theme == 'dark'
     
@@ -37,11 +38,12 @@ def plot_prophet_style(forecast_result, df, model_name):
         name='Observed data points',
         marker=dict(
             color='white' if is_dark_mode() else 'blue',  # Màu điểm thay đổi theo chế độ
-    size=4,
-    line=dict(
-        width=1, 
-        color='#1f77b4' if not is_dark_mode() else '#5fafff'  # Viền xanh đậm hơn trong chế độ tối)  # Thêm viền để nổi bật hơn
-        ))
+            size=4,
+            line=dict(
+                width=1, 
+                color='#1f77b4' if not is_dark_mode() else '#5fafff'  # Viền xanh đậm hơn trong chế độ tối
+            )
+        )
     ))
     
     # Các phần khác giữ nguyên...
@@ -417,10 +419,6 @@ div:contains("Cấu hình dự báo") {
 </style>
 """, unsafe_allow_html=True)
 
-
-
-
-
 # Sidebar
 with st.sidebar:
     st.markdown("### 📊 Ứng Dụng Phân Tích")
@@ -429,43 +427,118 @@ with st.sidebar:
     menu = st.radio("Chọn chức năng:", ["🏠 Trang chủ", "📈 Dự báo", "📊 Chỉ số kỹ thuật nâng cao"], label_visibility="collapsed")
 
 def clean_data(df):
-    if df is None or df.empty: return df
-    if isinstance(df.index, pd.DatetimeIndex): df = df.reset_index()
-    if 'Date' in df.columns: df = df.drop_duplicates(subset=['Date']).sort_values('Date')
-    cols = ['Adj Close', 'Open', 'High', 'Low', 'Close', 'Volume']
-    for col in cols:
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+    if df is None or df.empty: 
+        return df
+    
+    # Đảm bảo cột Date là datetime
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.sort_values('Date').drop_duplicates(subset=['Date'])
+    
+    # Chuyển đổi các cột số
+    numeric_cols = ['Adj Close', 'Close', 'High', 'Low', 'Open', 'Volume']
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+    # Fill missing values
     df = df.fillna(method='ffill').fillna(method='bfill')
+    
     return df
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_stock_data(symbol, start, end, retry_count=0):
     try:
         symbol = symbol.split(',')[0].strip().upper()
-        if isinstance(start, (datetime, pd.Timestamp)): start = start.strftime('%Y-%m-%d')
-        if isinstance(end, (datetime, pd.Timestamp)): end = end.strftime('%Y-%m-%d')
-        df = yf.download(symbol, start=start, end=end, progress=False, auto_adjust=False, threads=True)
-        if df is None or df.empty or len(df) == 0:
-            if '.' not in symbol:
-                st.info(f"Thử tải {symbol}.VN...")
-                df = yf.download(f"{symbol}.VN", start=start, end=end, progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            if retry_count < 2:
-                st.warning(f"Retry {retry_count + 1} cho {symbol}...")
-                return load_stock_data(symbol, start, end, retry_count + 1)
+        
+        # Ánh xạ mã chứng khoán với tên file
+        file_mapping = {
+            'COP': 'COP_cleaned.csv',
+            'CVX': 'CVX_cleaned.csv',
+            'FANG': 'FANG_cleaned.csv',
+            'SLB': 'SLB_cleaned.csv',
+            'XOM': 'XOM_cleaned.csv'
+        }
+        
+        if symbol not in file_mapping:
+            st.error(f"Không tìm thấy dữ liệu cho mã {symbol}. Chỉ hỗ trợ: {', '.join(file_mapping.keys())}")
             return None
-        if isinstance(df.columns, pd.MultiIndex): df.columns = df.columns.get_level_values(0)
-        df = df.reset_index()
+        
+        filename = file_mapping[symbol]
+        
+        # Kiểm tra file có tồn tại không
+        if not os.path.exists(filename):
+            st.error(f"Không tìm thấy file dữ liệu: {filename}")
+            return None
+        
+        # Đọc dữ liệu từ file CSV
+        df = pd.read_csv(filename)
+        
+        # Kiểm tra và chuyển đổi cột Date
+        date_columns = ['Date', 'date', 'DATE']
+        date_col = None
+        for col in date_columns:
+            if col in df.columns:
+                date_col = col
+                break
+        
+        if date_col:
+            df['Date'] = pd.to_datetime(df[date_col])
+            if date_col != 'Date':
+                df = df.drop(columns=[date_col])
+        else:
+            st.error("Không tìm thấy cột ngày tháng trong dữ liệu")
+            return None
+        
+        # Chuyển đổi ngày start và end sang datetime
+        if isinstance(start, str):
+            start = pd.to_datetime(start)
+        if isinstance(end, str):
+            end = pd.to_datetime(end)
+        
+        # Lọc dữ liệu theo khoảng thời gian
+        df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
+        
+        if df.empty:
+            st.warning(f"Không có dữ liệu trong khoảng thời gian từ {start} đến {end}")
+            return None
+        
+        # Clean dữ liệu
         df = clean_data(df)
-        required_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-        for col in required_cols:
-            if col not in df.columns:
-                st.error(f"Thiếu cột {col} trong dữ liệu")
-                return None
+        
+        # Đảm bảo có cột Close (nếu không có, dùng Adj Close)
+        if 'Close' not in df.columns and 'Adj Close' in df.columns:
+            df['Close'] = df['Adj Close']
+            st.info(f"Đang sử dụng 'Adj Close' thay cho 'Close' cho mã {symbol}")
+        
+        # Kiểm tra các cột cần thiết
+        required_cols = ['Date', 'Close']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        
+        if missing_cols:
+            st.error(f"Thiếu các cột cần thiết: {missing_cols}")
+            return None
+        
+        # Đảm bảo có đủ các cột khác, nếu thiếu thì tạo từ cột Close
+        if 'Open' not in df.columns:
+            df['Open'] = df['Close']
+        if 'High' not in df.columns:
+            df['High'] = df['Close']
+        if 'Low' not in df.columns:
+            df['Low'] = df['Close']
+        if 'Volume' not in df.columns:
+            df['Volume'] = 0  # Giá trị mặc định
+        
+        # Sắp xếp theo ngày
+        df = df.sort_values('Date')
+        
+        st.success(f"✅ Đã tải {len(df)} bản ghi dữ liệu từ {filename}")
         return df
+        
     except Exception as e:
         st.error(f"Lỗi tải dữ liệu {symbol}: {str(e)}")
-        if retry_count < 2: return load_stock_data(symbol, start, end, retry_count + 1)
+        import traceback
+        st.error(traceback.format_exc())
         return None
 
 def calculate_statistics(df):
@@ -518,10 +591,9 @@ class StockForecaster:
             naive_historical[0] = naive_historical[1]  # Xử lý giá trị đầu tiên
             errors = self.calculate_forecast_errors(self.data, naive_historical)
             
-            
             return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper,
-                   'lower': lower, 'method': 'Naïve', 'last_value': last_value, 'errors': errors,  # Thêm thông tin sai số
-            'fitted': np.roll(self.data, 1)}
+                   'lower': lower, 'method': 'Naïve', 'last_value': last_value, 'errors': errors,
+                   'fitted': np.roll(self.data, 1)}
         except Exception as e:
             st.error(f"Lỗi Naïve forecast: {e}")
             return None
@@ -566,9 +638,10 @@ class StockForecaster:
                     errors_metrics = self.calculate_forecast_errors(actual_values, ma_values_array)
                     
                     forecasts[f"MA-{window}"] = {'values': forecast_values, 'dates': forecast_dates,
-                                                 'upper': upper, 'lower': lower, 'window': window, 'method': f'Moving Average ({window} periods)',
-                    'errors': errors_metrics,
-                    'fitted': np.concatenate([np.full(window, np.nan), ma_values_array])}
+                                                 'upper': upper, 'lower': lower, 'window': window, 
+                                                 'method': f'Moving Average ({window} periods)',
+                                                 'errors': errors_metrics,
+                                                 'fitted': np.concatenate([np.full(window, np.nan), ma_values_array])}
                 except Exception as e:
                     st.warning(f"Không thể tính MA-{window}: {e}")
         return forecasts
@@ -735,7 +808,6 @@ class StockForecaster:
                     if optimize:
                         fit = model.fit(
                             optimized=True,
-                            
                             use_brute=False
                         )
                     else:
@@ -925,7 +997,8 @@ if menu == "🏠 Trang chủ":
     col1, col2, col3 = st.columns([2, 2, 2])
     
     with col1:
-        stock_symbol = st.text_input("Mã chứng khoán", value="COP", help="VD: COP, CVX, SLB")
+        stock_symbol = st.selectbox("Mã chứng khoán", ["COP", "CVX", "FANG", "SLB", "XOM"], 
+                                   help="Chọn mã chứng khoán từ danh sách có sẵn")
     
     with col2:
         start_date = st.date_input("Ngày bắt đầu", value=datetime(2019, 12, 14))
@@ -1067,7 +1140,8 @@ elif menu == "📈 Dự báo":
         col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            symbol = st.text_input("Mã chứng khoán", value="COP", key="forecast_symbol")
+            symbol = st.selectbox("Mã chứng khoán", ["COP", "CVX", "FANG", "SLB", "XOM"], 
+                                 key="forecast_symbol")
         
         with col2:
             forecast_days = st.slider("Chu kì dự báo", 7, 730, 180, 
@@ -1086,7 +1160,7 @@ elif menu == "📈 Dự báo":
                 ["Ngày", "Tuần", "Tháng"],
                 index=0,
                 help="Chọn đơn vị thời gian cho dự báo"
-                )
+            )
 
     # Chuyển đổi số ngày dự báo dựa trên khung thời gian
         if forecast_timeframe == "Tuần":
@@ -1095,6 +1169,7 @@ elif menu == "📈 Dự báo":
             actual_forecast_days = forecast_days * 30
         else:  # Ngày
             actual_forecast_days = forecast_days
+    
     # CHỌN MÔ HÌNH DỰ BÁO
     
     st.markdown("### 🎯 Cấu hình dự báo")
@@ -1103,29 +1178,29 @@ elif menu == "📈 Dự báo":
     model_options = ["Moving Average", "Exponential Smoothing", "Holt", "Holt-Winters", "Prophet"]
     model_config = {
         'MA': {
-           'windows': [3, 6, 9, 12, 24],
-           'use_wma': False,
-           'use_naive': True,
-           'use_drift': True
-           },
-        'ES': {
-        'alpha': None,
-        'optimize': True
+            'windows': [3, 6, 9, 12, 24],
+            'use_wma': False,
+            'use_naive': True,
+            'use_drift': True
         },
-         'Holt': {
-        'optimize': True,
-        'alpha': None,
-        'beta': None
-    },
+        'ES': {
+            'alpha': None,
+            'optimize': True
+        },
+        'Holt': {
+            'optimize': True,
+            'alpha': None,
+            'beta': None
+        },
         'HW': {
-        'seasonal_periods': 12,
-        'optimize': True,
-        'trend_type': 'add',
-        'seasonal_type': 'add'
-    },
+            'seasonal_periods': 12,
+            'optimize': True,
+            'trend_type': 'add',
+            'seasonal_type': 'add'
+        },
         'Prophet': {
-        'include_history': True
-    }
+            'include_history': True
+        }
     }
 
     # Chọn kiểu biểu đồ
@@ -1251,7 +1326,7 @@ elif menu == "📈 Dự báo":
                     if holt_result:
                         all_forecasts['Holt (Double ES)'] = holt_result
                     
-                                        # Thêm phiên bản Holt với tham số cố định
+                    # Thêm phiên bản Holt với tham số cố định
                     holt_fixed_result = forecaster.holt_forecast(
                         actual_forecast_days,
                         optimize=False,
@@ -1321,12 +1396,12 @@ elif menu == "📈 Dự báo":
                         
                         # Thêm đường giá gốc (đường liên tục)
                         fig.add_trace(go.Scatter(
-        x=df['Date'], 
-        y=df['Close'],
-        mode='lines',
-        name='Giá thực tế',
-        line=dict(color='blue', width=2)
-    ))
+                            x=df['Date'], 
+                            y=df['Close'],
+                            mode='lines',
+                            name='Giá thực tế',
+                            line=dict(color='blue', width=2)
+                        ))
                         # Dữ liệu lịch sử dạng chấm đen
                         fig.add_trace(go.Scatter(
                             x=df['Date'], 
@@ -1338,9 +1413,10 @@ elif menu == "📈 Dự báo":
                                 size=4,
                                 line=dict(
                                     width=1, 
-                                    color='#1f77b4' if not is_dark_mode() else '#5fafff' ) # Viền xanh đậm hơn trong chế độ tối
-        )
-    ))
+                                    color='#1f77b4' if not is_dark_mode() else '#5fafff'
+                                )
+                            )
+                        ))
                         
                         # Đường dự báo màu xanh
                         fig.add_trace(go.Scatter(
@@ -1378,23 +1454,23 @@ elif menu == "📈 Dự báo":
                             x0=last_date,
                             x1=last_date,
                             y0=0,
-        y1=1,
-        yref="paper",
-        line=dict(color="#1f77b4", width=1, dash="dash")
-    )
-                         # Add annotation separately
+                            y1=1,
+                            yref="paper",
+                            line=dict(color="#1f77b4", width=1, dash="dash")
+                        )
+                        
+                        # Add annotation separately
                         fig.add_annotation(
-        x=last_date,
-        y=1,
-        yref="paper",
-        text="Start of Forecast",
-        showarrow=False,
-        yshift=10,
-        font=dict(color="#1f77b4") 
-    )
+                            x=last_date,
+                            y=1,
+                            yref="paper",
+                            text="Start of Forecast",
+                            showarrow=False,
+                            yshift=10,
+                            font=dict(color="#1f77b4") 
+                        )
                       
                         # Chú thích cho giá trị cuối cùng và dự báo cuối
-                        
                         fig.add_annotation(
                             x=last_date,
                             y=df['Close'].max(),
@@ -1423,12 +1499,12 @@ elif menu == "📈 Dự báo":
                         
                         fig.update_layout(
                             title="Time Series Forecast with Prophet",
-        xaxis_title="Date",
-        yaxis_title="Adjusted Close Price",
-        legend_title="Legend",
-        height=600,
-        template="plotly_white" if not is_dark else "plotly_dark"
-    )
+                            xaxis_title="Date",
+                            yaxis_title="Adjusted Close Price",
+                            legend_title="Legend",
+                            height=600,
+                            template="plotly_white" if not is_dark else "plotly_dark"
+                        )
                         return fig 
                        
                     
@@ -1436,7 +1512,6 @@ elif menu == "📈 Dự báo":
                     def plot_holt_winters_optimized(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
                         template="plotly_white" if not is_dark else "plotly_dark"
-
 
                         fig = go.Figure()
                         
@@ -1948,8 +2023,6 @@ elif menu == "📈 Dự báo":
                     for model_name, forecast in all_forecasts.items():
                         with st.expander(f"📈 {model_name}", expanded=False):
                             # Hiển thị thông số mô hình
-                            
-                            
                             param_cols = st.columns(4)
                             col_idx = 0
                             
@@ -1985,7 +2058,6 @@ elif menu == "📈 Dự báo":
                             
                             # Hiển thị chỉ số đánh giá
                             if 'errors' in forecast:
-                                
                                 display_forecast_metrics(forecast, model_name)
                             
                             # Hiển thị dự báo
@@ -2036,9 +2108,9 @@ elif menu == "📈 Dự báo":
                         x=last_date, 
                         line_dash="dash",
                         line_color="red"
-                        )
+                    )
 
-# Thêm annotation riêng
+                    # Thêm annotation riêng
                     fig_compare.add_annotation(
                         x=last_date,
                         y=1,                # đỉnh khung vẽ
@@ -2047,7 +2119,7 @@ elif menu == "📈 Dự báo":
                         text="Last real data",
                         showarrow=False,
                         yshift=10           # nhích annotation lên một chút
-)
+                    )
                         
                     
                     fig_compare.update_layout(
@@ -2095,7 +2167,8 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
     
     col1, col2 = st.columns(2)
     with col1:
-        adv_symbol = st.text_input("Mã chứng khoán", value="COP", help="VD: COP, AAPL, SLB")
+        adv_symbol = st.selectbox("Mã chứng khoán", ["COP", "CVX", "FANG", "SLB", "XOM"], 
+                                 help="Chọn mã chứng khoán từ danh sách có sẵn")
     
     with col2:
         display_period = st.selectbox(
@@ -2172,33 +2245,29 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
     if st.button("🚀 Phân tích kỹ thuật", type="primary"):
         with st.spinner("Đang xử lý dữ liệu và tính toán chỉ số..."):
             try:
-                ticker = yf.Ticker(adv_symbol)
+                # Tải dữ liệu từ file CSV
+                end_date = datetime.now()
                 
-                short_term_periods = ["1mo", "3mo", "6mo"]
-                if selected_code in short_term_periods:
-                    download_period = "1y" 
-                else:
-                    download_period = selected_code 
+                # Xác định start_date dựa trên display_period
+                period_days = {
+                    "1 tháng": 30,
+                    "3 tháng": 90,
+                    "6 tháng": 180,
+                    "1 năm": 365,
+                    "2 năm": 730,
+                    "5 năm": 1825
+                }
                 
-                df = ticker.history(period=download_period)
+                start_date = end_date - timedelta(days=period_days[display_period])
                 
-                if df.empty:
+                df = load_stock_data(adv_symbol, start_date, end_date)
+                
+                if df is None or df.empty:
                     st.error("❌ Không có dữ liệu cho mã chứng khoán này.")
                 else:
-                    df = df.reset_index()
-                    df = clean_data(df)
-                    
                     # Áp dụng TechnicalAnalyzer
                     analyzer = TechnicalAnalyzer(df)
                     df_view = analyzer.df
-                    
-                    # Lọc dữ liệu hiển thị
-                    if selected_code == "1mo": 
-                        df_view = df_view.tail(22)
-                    elif selected_code == "3mo": 
-                        df_view = df_view.tail(65)
-                    elif selected_code == "6mo": 
-                        df_view = df_view.tail(130)
                     
                     st.success(f"✅ Đã phân tích chỉ số kỹ thuật cho **{adv_symbol.upper()}**")
                     
@@ -2340,15 +2409,15 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                     if show_candlestick:
                         fig.add_trace(
                             go.Candlestick(
-                            x=df_view['Date'],
-                            open=df_view['Open'], 
-                            high=df_view['High'],
-                            low=df_view['Low'], 
-                            close=df_view['Close'],
-                            name='Giá',
-                            increasing_line_color='#26a69a',
-                            decreasing_line_color='#ef5350'
-                        ), row=current_row, col=1)
+                                x=df_view['Date'],
+                                open=df_view['Open'], 
+                                high=df_view['High'],
+                                low=df_view['Low'], 
+                                close=df_view['Close'],
+                                name='Giá',
+                                increasing_line_color='#26a69a',
+                                decreasing_line_color='#ef5350'
+                            ), row=current_row, col=1)
                     else:
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
@@ -2699,4 +2768,3 @@ with st.sidebar:
     - MAPE 10-20%: Dự báo tốt
     - MAPE > 50%: Dự báo kém
     """)
-
