@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import warnings
 import logging
 import os
-from pathlib import Path
 
 # Thêm hàm kiểm tra chế độ tối/sáng
 def is_dark_mode():
@@ -15,44 +14,8 @@ def is_dark_mode():
     if 'theme' in st.session_state:
         return st.session_state.theme == 'dark'
     
-    # Hoặc bạn có thể thêm một checkbox để người dùng chọn
-    # return st.sidebar.checkbox("Chế độ tối", value=True)
-    
     # Mặc định là chế độ tối
     return True
-
-# Trong các hàm tạo biểu đồ
-def plot_prophet_style(forecast_result, df, model_name):
-    is_dark = is_dark_mode()
-    st.write(f"Debug - Chế độ tối: {is_dark}")  # Dòng debug
-    point_color = 'white' if is_dark else 'black'
-    text_color = 'white' if is_dark else 'black'
-    
-    fig = go.Figure()
-    
-    # Dữ liệu lịch sử dạng chấm
-    fig.add_trace(go.Scatter(
-        x=df['Date'], 
-        y=df['Close'],
-        mode='markers',
-        name='Observed data points',
-        marker=dict(
-            color='white' if is_dark_mode() else 'blue',  # Màu điểm thay đổi theo chế độ
-            size=4,
-            line=dict(
-                width=1, 
-                color='#1f77b4' if not is_dark_mode() else '#5fafff'  # Viền xanh đậm hơn trong chế độ tối
-            )
-        )
-    ))
-    
-    # Các phần khác giữ nguyên...
-    
-    fig.update_layout(
-        template="plotly_white" if not is_dark else "plotly_dark"
-    )
-    
-    return fig
 
 # Imports cho các mô hình dự báo
 try:
@@ -72,7 +35,7 @@ except ImportError:
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 
-# [GIỮ NGUYÊN PHẦN TechnicalAnalyzer CLASS]
+# Lớp phân tích kỹ thuật
 class TechnicalAnalyzer:
     def __init__(self, df):
         self.df = df.copy()
@@ -237,6 +200,558 @@ class TechnicalAnalyzer:
         if wr_value > -20: return "Quá mua"
         elif wr_value < -80: return "Quá bán"
         else: return "Trung tính"
+
+# Lớp dự báo cổ phiếu
+class StockForecaster:
+    def __init__(self, df):
+        self.df = df.copy()
+        self.data = df['Close'].values
+        self.dates = df['Date'].values
+    
+    def calculate_forecast_errors(self, actual, forecast):
+        errors = actual - forecast
+        mae = np.mean(np.abs(errors))
+        mse = np.mean(errors ** 2)
+        rmse = np.sqrt(mse)
+        mape = np.mean(np.abs(errors / actual)) * 100
+        mpe = np.mean(errors / actual) * 100
+        return {'MAE': mae, 'MSE': mse, 'RMSE': rmse, 'MAPE': mape, 'MPE': mpe}
+    
+    def naive_forecast(self, steps=30):
+        try:
+            last_value = self.data[-1]
+            forecast_values = np.full(steps, last_value)
+            changes = np.diff(self.data)
+            std_changes = np.std(changes)
+            upper = forecast_values + 1.96 * std_changes * np.sqrt(np.arange(1, steps + 1))
+            lower = forecast_values - 1.96 * std_changes * np.sqrt(np.arange(1, steps + 1))
+            forecast_dates = pd.date_range(
+                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
+                periods=steps, freq='D')
+            
+            # Tính sai số trên dữ liệu lịch sử
+            naive_historical = np.roll(self.data, 1)
+            naive_historical[0] = naive_historical[1]  # Xử lý giá trị đầu tiên
+            errors = self.calculate_forecast_errors(self.data, naive_historical)
+            
+            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper,
+                   'lower': lower, 'method': 'Naïve', 'last_value': last_value, 'errors': errors,
+                   'fitted': np.roll(self.data, 1)}
+        except Exception as e:
+            st.error(f"Lỗi Naïve forecast: {e}")
+            return None
+    
+    def drift_forecast(self, steps=30):
+        try:
+            last_value, first_value, n = self.data[-1], self.data[0], len(self.data)
+            drift = (last_value - first_value) / (n - 1)
+            forecast_values = last_value + drift * np.arange(1, steps + 1)
+            residuals = np.diff(self.data) - drift
+            std_residuals = np.std(residuals)
+            upper = forecast_values + 1.96 * std_residuals * np.sqrt(np.arange(1, steps + 1))
+            lower = forecast_values - 1.96 * std_residuals * np.sqrt(np.arange(1, steps + 1))
+            forecast_dates = pd.date_range(
+                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
+                periods=steps, freq='D')
+            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper,
+                   'lower': lower, 'method': 'Drift', 'drift': drift}
+        except Exception as e:
+            st.error(f"Lỗi Drift forecast: {e}")
+            return None
+    
+    def moving_average_forecast(self, steps=30, windows=[3,6,9,12]):
+        forecasts = {}
+        for window in windows:
+            if len(self.data) >= window:
+                try:
+                    ma_values = [np.mean(self.data[i-window:i]) for i in range(window, len(self.data)+1)]
+                    last_ma = ma_values[-1]
+                    forecast_values = np.full(steps, last_ma)
+                    actual_values = self.data[window:]
+                    ma_values_array = np.array(ma_values)
+                    if len(actual_values) != len(ma_values_array):
+                        min_len = min(len(actual_values), len(ma_values_array))
+                        actual_values, ma_values_array = actual_values[:min_len], ma_values_array[:min_len]
+                    errors = actual_values - ma_values_array
+                    std_error = np.std(errors)
+                    upper, lower = forecast_values + 1.96 * std_error, forecast_values - 1.96 * std_error
+                    forecast_dates = pd.date_range(
+                        start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
+                        periods=steps, freq='D')
+                    errors_metrics = self.calculate_forecast_errors(actual_values, ma_values_array)
+                    
+                    forecasts[f"MA-{window}"] = {'values': forecast_values, 'dates': forecast_dates,
+                                                 'upper': upper, 'lower': lower, 'window': window, 
+                                                 'method': f'Moving Average ({window} periods)',
+                                                 'errors': errors_metrics,
+                                                 'fitted': np.concatenate([np.full(window, np.nan), ma_values_array])}
+                except Exception as e:
+                    st.warning(f"Không thể tính MA-{window}: {e}")
+        return forecasts
+    
+    def simple_exponential_smoothing(self, steps=30, alpha=None, optimize=False):
+        try:
+            if not STATSMODELS_AVAILABLE:
+                st.warning("Statsmodels không khả dụng")
+                return None
+            
+            # Nếu không tối ưu và không có alpha, dùng 0.1 (chuẩn)
+            if not optimize and alpha is None:
+                alpha = 0.1  # Giá trị mặc định theo tiêu chuẩn 
+            
+            # Nếu tối ưu, tìm alpha tốt nhất
+            if optimize:
+                # Phương pháp 1: Grid search chi tiết
+                best_alpha, best_sse = None, float('inf')
+                # Mở rộng phạm vi tìm kiếm từ 0.01 đến 1.0 với bước nhảy nhỏ hơn
+                for test_alpha in np.arange(0.01, 1.01, 0.05):  # Bước nhảy 0.05 để chi tiết hơn 
+                    try:
+                        model = ExponentialSmoothing(self.data, trend=None, seasonal=None, 
+                                                   initialization_method='estimated')
+                        fit = model.fit(smoothing_level=test_alpha, optimized=False)
+                        sse = np.sum(fit.resid ** 2)
+                        if sse < best_sse:
+                            best_sse, best_alpha = sse, test_alpha
+                    except Exception as e:
+                        continue
+                
+                # Phương pháp 2: Sử dụng tối ưu hóa tích hợp của statsmodels
+                try:
+                    model_auto = ExponentialSmoothing(self.data, trend=None, seasonal=None, 
+                                                   initialization_method='estimated')
+                    fit_auto = model_auto.fit(optimized=True)
+                    auto_alpha = fit_auto.params.get('smoothing_level', None)
+                    auto_sse = np.sum(fit_auto.resid ** 2)
+                    
+                    # So sánh kết quả từ hai phương pháp
+                    if auto_sse < best_sse and auto_alpha is not None:
+                        best_alpha, best_sse = auto_alpha, auto_sse
+                except Exception as e:
+                    st.warning(f"Không thể tối ưu tự động: {e}")
+                
+                alpha = best_alpha if best_alpha else 0.1
+                
+                # Thông báo về alpha tối ưu
+                if alpha > 0.9:
+                    st.warning(f"⚠️ Alpha tối ưu cao ({alpha:.3f}): Mô hình nhạy cảm với dữ liệu gần đây, gần với mô hình Naive")
+                    if alpha > 0.99:
+                        st.info(f"✅ Alpha tối ưu xấp xỉ 1.0: Mô hình tương đương với dự báo Naive")
+                else:
+                    st.info(f"✅ Alpha tối ưu tìm được: {alpha:.3f}")
+            
+            # Fit model với alpha đã chọn
+            model = ExponentialSmoothing(self.data, trend=None, seasonal=None, 
+                                        initialization_method='estimated')
+            fit = model.fit(smoothing_level=alpha, optimized=False)
+            forecast_values = fit.forecast(steps)
+            residuals = fit.resid
+            std_residuals = np.std(residuals)
+            upper, lower = forecast_values + 1.96 * std_residuals, forecast_values - 1.96 * std_residuals
+            forecast_dates = pd.date_range(
+                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
+                periods=steps, freq='D')
+            errors = self.calculate_forecast_errors(self.data[1:], fit.fittedvalues[1:])
+            
+            # Thêm thông tin về mô hình
+            model_info = {
+                'values': forecast_values, 
+                'dates': forecast_dates, 
+                'upper': upper, 
+                'lower': lower,
+                'alpha': alpha, 
+                'method': f'Simple Exponential Smoothing (Alpha={alpha:.3f})', 
+                'errors': errors,
+                'fitted': fit.fittedvalues,
+                'aic': fit.aic,
+                'bic': fit.bic,
+                'is_optimized': optimize
+            }
+            
+            return model_info
+        except Exception as e:
+            st.error(f"Lỗi Simple ES: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return None
+
+    
+    def holt_forecast(self, steps=30, optimize=True, alpha=None, beta=None):
+        try:
+            if not STATSMODELS_AVAILABLE:
+                st.warning("Statsmodels không khả dụng")
+                return None
+            
+            # Giá trị mặc định tiêu chuẩn cho alpha và beta
+            default_alpha = 0.10  # Giá trị mặc định tiêu chuẩn 
+            default_beta = 0.20   # Giá trị mặc định tiêu chuẩn 
+            
+            model = ExponentialSmoothing(self.data, trend='add', seasonal=None, 
+                                        initialization_method='estimated')
+            
+            if optimize:
+                # Tối ưu hóa dựa vào dữ liệu với grid search chi tiết hơn
+                best_alpha, best_beta, best_sse = None, None, float('inf')
+                
+                # Phương pháp 1: Grid search chi tiết
+                for test_alpha in np.arange(0.05, 1.0, 0.05):  # Bước nhảy nhỏ hơn 
+                    for test_beta in np.arange(0.05, 1.0, 0.05):  # Bước nhảy nhỏ hơn
+                        try:
+                            fit = model.fit(smoothing_level=test_alpha, smoothing_trend=test_beta, 
+                                          optimized=False)
+                            sse = np.sum(fit.resid ** 2)
+                            if sse < best_sse:
+                                best_sse, best_alpha, best_beta = sse, test_alpha, test_beta
+                        except: continue
+                
+                # Phương pháp 2: Sử dụng tối ưu hóa tích hợp của statsmodels
+                try:
+                    fit_auto = model.fit(optimized=True)
+                    auto_alpha = fit_auto.params.get('smoothing_level', None)
+                    auto_beta = fit_auto.params.get('smoothing_trend', None)
+                    auto_sse = np.sum(fit_auto.resid ** 2)
+                    
+                    # So sánh kết quả từ hai phương pháp
+                    if auto_sse < best_sse and auto_alpha is not None and auto_beta is not None:
+                        best_sse, best_alpha, best_beta = auto_sse, auto_alpha, auto_beta
+                except Exception as e:
+                    st.warning(f"Không thể tối ưu tự động Holt: {e}")
+                
+                # Sử dụng giá trị tối ưu hoặc mặc định nếu không tìm được
+                alpha = best_alpha if best_alpha is not None else default_alpha
+                beta = best_beta if best_beta is not None else default_beta
+                
+                # Thông báo về tham số tối ưu
+                if alpha > 0.8 or beta > 0.8:
+                    st.warning(f"⚠️ Holt - Tham số cao (α={alpha:.3f}, β={beta:.3f}): Mô hình nhạy cảm với dữ liệu gần đây")
+                else:
+                    st.info(f"✅ Holt - Alpha: {alpha:.3f}, Beta: {beta:.3f}")
+            else:
+                # Sử dụng giá trị mặc định hoặc được chỉ định
+                alpha = alpha if alpha is not None else default_alpha
+                beta = beta if beta is not None else default_beta
+            
+            fit = model.fit(smoothing_level=alpha, smoothing_trend=beta, optimized=False)
+            forecast_values = fit.forecast(steps)
+            residuals = fit.resid
+            std_residuals = np.std(residuals)
+            upper = forecast_values + 1.96 * std_residuals * np.sqrt(np.arange(1, steps+1))
+            lower = forecast_values - 1.96 * std_residuals * np.sqrt(np.arange(1, steps+1))
+            forecast_dates = pd.date_range(
+                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
+                periods=steps, freq='D')
+            errors = self.calculate_forecast_errors(self.data[1:], fit.fittedvalues[1:])
+            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper, 'lower': lower,
+                   'alpha': alpha, 'beta': beta, 'method': f'Holt (Double ES) (Alpha={alpha:.3f}, Beta={beta:.3f})',
+                   'errors': errors, 'fitted': fit.fittedvalues, 'level': fit.level, 'trend': fit.trend,
+                   'aic': fit.aic, 'bic': fit.bic}
+        except Exception as e:
+            st.error(f"Lỗi Holt: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return None
+
+    
+    def holt_winters_forecast(self, steps=30, seasonal_periods=12, 
+                             trend_type='add', seasonal_type='add', optimize=True):
+        try:
+            if not STATSMODELS_AVAILABLE:
+                st.warning("Statsmodels không khả dụng")
+                return None
+            
+            # Giá trị mặc định tiêu chuẩn
+            default_alpha = 0.1  # Giá trị mặc định tiêu chuẩn 
+            default_beta = 0.2   # Giá trị mặc định tiêu chuẩn 
+            default_gamma = 0.3  # Giá trị mặc định tiêu chuẩn 
+            
+            # Lưu seasonal_periods vào biến local để tránh lỗi
+            _seasonal_periods = seasonal_periods
+            
+            # Kiểm tra dữ liệu đủ dài
+            if len(self.data) < 2 * _seasonal_periods:
+                # Điều chỉnh chu kỳ mùa vụ nếu dữ liệu quá ngắn
+                old_periods = _seasonal_periods
+                _seasonal_periods = max(4, len(self.data) // 3)
+                st.warning(f"Dữ liệu ngắn, điều chỉnh chu kỳ mùa vụ: {old_periods} → {_seasonal_periods}")
+            
+            results = {}
+            
+            # Danh sách các cấu hình cần thử
+            configs = []
+            
+            if optimize:
+                # Thử tất cả các kết hợp
+                for trend in ['add', 'mul']:
+                    for seasonal in ['add', 'mul']:
+                        configs.append((trend, seasonal, 'optimized'))
+            else:
+                # Chỉ dùng cấu hình cho trước với tham số mặc định
+                configs.append((trend_type, seasonal_type, 'standard'))
+            
+            for trend, seasonal, config_type in configs:
+                try:
+                    model = ExponentialSmoothing(
+                        self.data,
+                        trend=trend,
+                        seasonal=seasonal,
+                        seasonal_periods=_seasonal_periods,
+                        initialization_method='estimated'
+                    )
+                    
+                    # Fit với giới hạn tham số
+                    if optimize:
+                        # Phương pháp 1: Tối ưu hóa tích hợp
+                        fit = model.fit(
+                            optimized=True,
+                            use_brute=False
+                        )
+                        
+                        # Phương pháp 2: Grid search nếu tối ưu hóa tích hợp thất bại
+                        if fit is None or not hasattr(fit, 'params'):
+                            best_alpha, best_beta, best_gamma, best_sse = None, None, None, float('inf')
+                            
+                            for test_alpha in np.arange(0.1, 1.0, 0.2):
+                                for test_beta in np.arange(0.1, 1.0, 0.2):
+                                    for test_gamma in np.arange(0.1, 1.0, 0.2):
+                                        try:
+                                            test_fit = model.fit(
+                                                smoothing_level=test_alpha,
+                                                smoothing_trend=test_beta,
+                                                smoothing_seasonal=test_gamma,
+                                                optimized=False
+                                            )
+                                            sse = np.sum(test_fit.resid ** 2)
+                                            if sse < best_sse:
+                                                best_sse = sse
+                                                best_alpha, best_beta, best_gamma = test_alpha, test_beta, test_gamma
+                                        except: continue
+                            
+                            if best_alpha is not None:
+                                fit = model.fit(
+                                    smoothing_level=best_alpha,
+                                    smoothing_trend=best_beta,
+                                    smoothing_seasonal=best_gamma,
+                                    optimized=False
+                                )
+                    else:
+                        # Sử dụng tham số mặc định tiêu chuẩn
+                        fit = model.fit(
+                            smoothing_level=default_alpha,
+                            smoothing_trend=default_beta,
+                            smoothing_seasonal=default_gamma,
+                            optimized=False
+                        )
+                    
+                    forecast_values = fit.forecast(steps)
+                    
+                    # Khoảng tin cậy
+                    residuals = fit.resid
+                    std_residuals = np.std(residuals)
+                    
+                    upper = forecast_values + 1.96 * std_residuals
+                    lower = forecast_values - 1.96 * std_residuals
+                    
+                    forecast_dates = pd.date_range(
+                        start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
+                        periods=steps
+                    )
+                    
+                    # Tính các chỉ số
+                    errors = self.calculate_forecast_errors(
+                        self.data[_seasonal_periods:],
+                        fit.fittedvalues[_seasonal_periods:]
+                    )
+                    
+                    # Lấy tham số
+                    alpha = fit.params.get('smoothing_level', default_alpha)
+                    beta = fit.params.get('smoothing_trend', default_beta)
+                    gamma = fit.params.get('smoothing_seasonal', default_gamma)
+                    
+                    method_name = f"Holt-Winters ({config_type.title()})"
+                    if config_type == 'optimized':
+                        method_name = f"Holt-Winters (Trend:{trend}, Seasonal:{seasonal})"
+                    
+                    results[method_name] = {
+                        'values': forecast_values,
+                        'dates': forecast_dates,
+                        'upper': upper,
+                        'lower': lower,
+                        'alpha': alpha,
+                        'beta': beta,
+                        'gamma': gamma,
+                        'trend_type': trend,
+                        'seasonal_type': seasonal,
+                        'seasonal_periods': _seasonal_periods,
+                        'method': method_name,
+                        'errors': errors,
+                        'fitted': fit.fittedvalues,
+                        'aic': fit.aic,
+                        'bic': fit.bic
+                    }
+                    
+                    st.success(f"{method_name} - AIC: {fit.aic:.2f}, α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}")
+                    
+                except Exception as e:
+                    st.warning(f"Không thể fit {trend}/{seasonal}: {str(e)}")
+                    continue
+            
+            return results
+            
+        except Exception as e:
+            st.error(f"Lỗi Holt-Winters: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return None
+
+    
+    def prophet_forecast(self, steps=30):
+        try:
+            if not PROPHET_AVAILABLE:
+                st.warning("Prophet không khả dụng")
+                return None
+            
+            # Chuẩn bị dữ liệu
+            prophet_df = self.df[['Date', 'Close']].copy()
+            prophet_df.columns = ['ds', 'y']
+            
+            # Đảm bảo kiểu dữ liệu chính xác
+            prophet_df['ds'] = pd.to_datetime(prophet_df['ds'])
+            prophet_df['y'] = prophet_df['y'].astype(float)
+            
+            # Tạo model
+            model = Prophet(
+                yearly_seasonality=True,
+                weekly_seasonality=True,
+                daily_seasonality=False,
+                changepoint_prior_scale=0.05,
+                seasonality_prior_scale=10.0,
+                interval_width=0.95
+            )
+            
+            # Thêm tính mùa vụ tháng
+            model.add_seasonality(
+                name='monthly',
+                period=30.5,
+                fourier_order=5
+            )
+            
+            # Fit model
+            model.fit(prophet_df)
+            
+            # Tạo future dataframe
+            future = model.make_future_dataframe(periods=steps)
+            
+            # Dự báo
+            forecast = model.predict(future)
+            
+            # Lấy phần dự báo tương lai
+            future_forecast = forecast.tail(steps)
+            
+            # Tính các chỉ số từ dữ liệu lịch sử
+            historical_forecast = forecast.head(len(self.data))
+            errors = self.calculate_forecast_errors(
+                self.data,
+                historical_forecast['yhat'].values
+            )
+            
+            return {
+                'values': future_forecast['yhat'].values,
+                'dates': pd.to_datetime(future_forecast['ds'].values),
+                'upper': future_forecast['yhat_upper'].values,
+                'lower': future_forecast['yhat_lower'].values,
+                'method': 'Facebook Prophet',
+                'model': model,
+                'forecast_full': forecast,
+                'errors': errors,
+                'trend': future_forecast['trend'].values,
+                'seasonal': future_forecast['yearly'].values if 'yearly' in future_forecast.columns else None
+            }
+            
+        except Exception as e:
+            st.error(f"Lỗi Prophet: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+            return None
+
+# Hàm hiển thị metrics dự báo
+def display_forecast_metrics(forecast_result, model_name):
+    if forecast_result and 'errors' in forecast_result:
+        errors = forecast_result['errors']
+        
+        st.markdown(f"#### 📊 Chỉ số đo độ lệch - {model_name}")
+        
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            st.metric("MAE", f"{errors['MAE']:.4f}", 
+                     help="Mean Absolute Error - Sai số tuyệt đối trung bình")
+        
+        with col2:
+            st.metric("MSE", f"{errors['MSE']:.4f}",
+                     help="Mean Squared Error - Sai số bình phương trung bình")
+        
+        with col3:
+            st.metric("RMSE", f"{errors['RMSE']:.4f}",
+                     help="Root Mean Squared Error - Căn bậc hai của MSE")
+        
+        with col4:
+            st.metric("MAPE", f"{errors['MAPE']:.2f}%",
+                     help="Mean Absolute Percentage Error - Sai số phần trăm tuyệt đối")
+        
+        with col5:
+            st.metric("MPE", f"{errors['MPE']:.2f}%",
+                     help="Mean Percentage Error - Sai số phần trăm trung bình")
+        
+        # Đánh giá chất lượng dự báo
+        if errors['MAPE'] < 10:
+            quality = "🟢 Rất tốt"
+        elif errors['MAPE'] < 20:
+            quality = "🟡 Tốt"
+        elif errors['MAPE'] < 50:
+            quality = "🟠 Chấp nhận được"
+        else:
+            quality = "🔴 Kém"
+        
+        st.markdown(f"**Chất lượng dự báo:** {quality}")
+
+# Hàm làm sạch dữ liệu
+def clean_data(df):
+    if df is None or df.empty: return df
+    if isinstance(df.index, pd.DatetimeIndex): df = df.reset_index()
+    if 'Date' in df.columns: df = df.drop_duplicates(subset=['Date']).sort_values('Date')
+    cols = ['Adj Close', 'Open', 'High', 'Low', 'Close', 'Volume']
+    for col in cols:
+        if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    return df
+
+# Hàm tính thống kê
+def calculate_statistics(df):
+    stats = {}
+    target_cols = ['Adj Close', 'Open', 'High', 'Low', 'Close', 'Volume']
+    for col in target_cols:
+        if col in df.columns:
+            idx_min, idx_max = df[col].idxmin(), df[col].idxmax()
+            date_min, date_max = df.loc[idx_min, 'Date'], df.loc[idx_max, 'Date']
+            stats[col] = {'Mean': df[col].mean(), 'Std': df[col].std(), 'Min': df[col].min(),
+                         'Min Date': date_min.strftime('%Y-%m-%d'), 'Max': df[col].max(),
+                         'Max Date': date_max.strftime('%Y-%m-%d'), 'Median': df[col].median()}
+    return stats
+
+# Hàm tính ma trận tương quan
+def calculate_correlation(df):
+    numeric_cols = ['Adj Close', 'Open', 'High', 'Low', 'Close', 'Volume']
+    available_cols = [col for col in numeric_cols if col in df.columns]
+    return df[available_cols].corr()
+
+# Hàm đọc dữ liệu từ file
+def load_data_file(file_name):
+    try:
+        df = pd.read_csv(file_name)
+        df['Date'] = pd.to_datetime(df['Date'])
+        return clean_data(df)
+    except Exception as e:
+        st.error(f"Lỗi khi đọc file {file_name}: {str(e)}")
+        return None
 
 # Cấu hình trang
 st.set_page_config(page_title="Phân Tích Chứng Khoán", page_icon="📈", layout="wide")
@@ -415,9 +930,17 @@ div:contains("Cấu hình dự báo") {
     background-color: #1f77b4 !important;
     border-color: #1f77b4 !important;
 }
-
 </style>
 """, unsafe_allow_html=True)
+
+# Danh sách các file dữ liệu có sẵn
+file_options = {
+    "COP": "COP_cleaned.csv",
+    "CVX": "CVX_cleaned.csv",
+    "FANG": "FANG_cleaned.csv",
+    "SLB": "SLB_cleaned.csv",
+    "XOM": "XOM_cleaned.csv"
+}
 
 # Sidebar
 with st.sidebar:
@@ -426,590 +949,17 @@ with st.sidebar:
     st.markdown("---")
     menu = st.radio("Chọn chức năng:", ["🏠 Trang chủ", "📈 Dự báo", "📊 Chỉ số kỹ thuật nâng cao"], label_visibility="collapsed")
 
-def clean_data(df):
-    if df is None or df.empty: 
-        return df
-    
-    # Đảm bảo cột Date là datetime
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date').drop_duplicates(subset=['Date'])
-    
-    # Chuyển đổi các cột số
-    numeric_cols = ['Adj Close', 'Close', 'High', 'Low', 'Open', 'Volume']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    # Fill missing values
-    df = df.fillna(method='ffill').fillna(method='bfill')
-    
-    return df
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_stock_data(symbol, start, end, retry_count=0):
-    try:
-        symbol = symbol.split(',')[0].strip().upper()
-        
-        # Ánh xạ mã chứng khoán với tên file
-        file_mapping = {
-            'COP': 'COP_cleaned.csv',
-            'CVX': 'CVX_cleaned.csv',
-            'FANG': 'FANG_cleaned.csv',
-            'SLB': 'SLB_cleaned.csv',
-            'XOM': 'XOM_cleaned.csv'
-        }
-        
-        if symbol not in file_mapping:
-            st.error(f"Không tìm thấy dữ liệu cho mã {symbol}. Chỉ hỗ trợ: {', '.join(file_mapping.keys())}")
-            return None
-        
-        filename = file_mapping[symbol]
-        
-        # Kiểm tra file có tồn tại không
-        if not os.path.exists(filename):
-            st.error(f"Không tìm thấy file dữ liệu: {filename}")
-            return None
-        
-        # Đọc dữ liệu từ file CSV
-        df = pd.read_csv(filename)
-        
-        # Kiểm tra và chuyển đổi cột Date
-        date_columns = ['Date', 'date', 'DATE']
-        date_col = None
-        for col in date_columns:
-            if col in df.columns:
-                date_col = col
-                break
-        
-        if date_col:
-            df['Date'] = pd.to_datetime(df[date_col])
-            if date_col != 'Date':
-                df = df.drop(columns=[date_col])
-        else:
-            st.error("Không tìm thấy cột ngày tháng trong dữ liệu")
-            return None
-        
-        # Chuyển đổi ngày start và end sang datetime
-        if isinstance(start, str):
-            start = pd.to_datetime(start)
-        if isinstance(end, str):
-            end = pd.to_datetime(end)
-        
-        # Lọc dữ liệu theo khoảng thời gian
-        df = df[(df['Date'] >= pd.Timestamp(start)) & (df['Date'] <= pd.Timestamp(end))]
-        
-        if df.empty:
-            st.warning(f"Không có dữ liệu trong khoảng thời gian từ {start} đến {end}")
-            return None
-        
-        # Clean dữ liệu
-        df = clean_data(df)
-        
-        # Đảm bảo có cột Close (nếu không có, dùng Adj Close)
-        if 'Close' not in df.columns and 'Adj Close' in df.columns:
-            df['Close'] = df['Adj Close']
-            st.info(f"Đang sử dụng 'Adj Close' thay cho 'Close' cho mã {symbol}")
-        
-        # Kiểm tra các cột cần thiết
-        required_cols = ['Date', 'Close']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        
-        if missing_cols:
-            st.error(f"Thiếu các cột cần thiết: {missing_cols}")
-            return None
-        
-        # Đảm bảo có đủ các cột khác, nếu thiếu thì tạo từ cột Close
-        if 'Open' not in df.columns:
-            df['Open'] = df['Close']
-        if 'High' not in df.columns:
-            df['High'] = df['Close']
-        if 'Low' not in df.columns:
-            df['Low'] = df['Close']
-        if 'Volume' not in df.columns:
-            df['Volume'] = 0  # Giá trị mặc định
-        
-        # Sắp xếp theo ngày
-        df = df.sort_values('Date')
-        
-        st.success(f"✅ Đã tải {len(df)} bản ghi dữ liệu từ {filename}")
-        return df
-        
-    except Exception as e:
-        st.error(f"Lỗi tải dữ liệu {symbol}: {str(e)}")
-        import traceback
-        st.error(traceback.format_exc())
-        return None
-
-def calculate_statistics(df):
-    stats = {}
-    target_cols = ['Adj Close', 'Open', 'High', 'Low', 'Close', 'Volume']
-    for col in target_cols:
-        if col in df.columns:
-            idx_min, idx_max = df[col].idxmin(), df[col].idxmax()
-            date_min, date_max = df.loc[idx_min, 'Date'], df.loc[idx_max, 'Date']
-            stats[col] = {'Mean': df[col].mean(), 'Std': df[col].std(), 'Min': df[col].min(),
-                         'Min Date': date_min.strftime('%Y-%m-%d'), 'Max': df[col].max(),
-                         'Max Date': date_max.strftime('%Y-%m-%d'), 'Median': df[col].median()}
-    return stats
-
-def calculate_correlation(df):
-    numeric_cols = ['Adj Close', 'Open', 'High', 'Low', 'Close', 'Volume']
-    available_cols = [col for col in numeric_cols if col in df.columns]
-    return df[available_cols].corr()
-
-# ==================== StockForecaster CLASS - PHẦN ĐÃ SỬA ====================
-class StockForecaster:
-    def __init__(self, df):
-        self.df = df.copy()
-        self.data = df['Close'].values
-        self.dates = df['Date'].values
-    
-    def calculate_forecast_errors(self, actual, forecast):
-        errors = actual - forecast
-        mae = np.mean(np.abs(errors))
-        mse = np.mean(errors ** 2)
-        rmse = np.sqrt(mse)
-        mape = np.mean(np.abs(errors / actual)) * 100
-        mpe = np.mean(errors / actual) * 100
-        return {'MAE': mae, 'MSE': mse, 'RMSE': rmse, 'MAPE': mape, 'MPE': mpe}
-    
-    def naive_forecast(self, steps=30):
-        try:
-            last_value = self.data[-1]
-            forecast_values = np.full(steps, last_value)
-            changes = np.diff(self.data)
-            std_changes = np.std(changes)
-            upper = forecast_values + 1.96 * std_changes * np.sqrt(np.arange(1, steps + 1))
-            lower = forecast_values - 1.96 * std_changes * np.sqrt(np.arange(1, steps + 1))
-            forecast_dates = pd.date_range(
-                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                periods=steps, freq='D')
-            
-            # Tính sai số trên dữ liệu lịch sử
-            naive_historical = np.roll(self.data, 1)
-            naive_historical[0] = naive_historical[1]  # Xử lý giá trị đầu tiên
-            errors = self.calculate_forecast_errors(self.data, naive_historical)
-            
-            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper,
-                   'lower': lower, 'method': 'Naïve', 'last_value': last_value, 'errors': errors,
-                   'fitted': np.roll(self.data, 1)}
-        except Exception as e:
-            st.error(f"Lỗi Naïve forecast: {e}")
-            return None
-    
-    def drift_forecast(self, steps=30):
-        try:
-            last_value, first_value, n = self.data[-1], self.data[0], len(self.data)
-            drift = (last_value - first_value) / (n - 1)
-            forecast_values = last_value + drift * np.arange(1, steps + 1)
-            residuals = np.diff(self.data) - drift
-            std_residuals = np.std(residuals)
-            upper = forecast_values + 1.96 * std_residuals * np.sqrt(np.arange(1, steps + 1))
-            lower = forecast_values - 1.96 * std_residuals * np.sqrt(np.arange(1, steps + 1))
-            forecast_dates = pd.date_range(
-                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                periods=steps, freq='D')
-            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper,
-                   'lower': lower, 'method': 'Drift', 'drift': drift}
-        except Exception as e:
-            st.error(f"Lỗi Drift forecast: {e}")
-            return None
-    
-    def moving_average_forecast(self, steps=30, windows=[3,6,9,12]):
-        forecasts = {}
-        for window in windows:
-            if len(self.data) >= window:
-                try:
-                    ma_values = [np.mean(self.data[i-window:i]) for i in range(window, len(self.data)+1)]
-                    last_ma = ma_values[-1]
-                    forecast_values = np.full(steps, last_ma)
-                    actual_values = self.data[window:]
-                    ma_values_array = np.array(ma_values)
-                    if len(actual_values) != len(ma_values_array):
-                        min_len = min(len(actual_values), len(ma_values_array))
-                        actual_values, ma_values_array = actual_values[:min_len], ma_values_array[:min_len]
-                    errors = actual_values - ma_values_array
-                    std_error = np.std(errors)
-                    upper, lower = forecast_values + 1.96 * std_error, forecast_values - 1.96 * std_error
-                    forecast_dates = pd.date_range(
-                        start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                        periods=steps, freq='D')
-                    errors_metrics = self.calculate_forecast_errors(actual_values, ma_values_array)
-                    
-                    forecasts[f"MA-{window}"] = {'values': forecast_values, 'dates': forecast_dates,
-                                                 'upper': upper, 'lower': lower, 'window': window, 
-                                                 'method': f'Moving Average ({window} periods)',
-                                                 'errors': errors_metrics,
-                                                 'fitted': np.concatenate([np.full(window, np.nan), ma_values_array])}
-                except Exception as e:
-                    st.warning(f"Không thể tính MA-{window}: {e}")
-        return forecasts
-    
-    def weighted_moving_average_forecast(self, steps=30, window=6):
-        try:
-            if len(self.data) < window: return None
-            weights = np.arange(1, window + 1)
-            wma_values = [np.sum(weights * self.data[i-window+1:i+1]) / np.sum(weights) 
-                         for i in range(window-1, len(self.data))]
-            last_wma = wma_values[-1]
-            forecast_values = np.full(steps, last_wma)
-            actual_values = self.data[window:]
-            errors = actual_values - wma_values
-            std_error = np.std(errors)
-            upper, lower = forecast_values + 1.96 * std_error, forecast_values - 1.96 * std_error
-            forecast_dates = pd.date_range(
-                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                periods=steps, freq='D')
-            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper,
-                   'lower': lower, 'method': f'Weighted MA ({window} periods)', 'window': window}
-        except Exception as e:
-            st.error(f"Lỗi WMA: {e}")
-            return None
-    
-    def simple_exponential_smoothing(self, steps=30, alpha=None, optimize=False):
-        """PHẦN ĐÃ SỬA - Alpha chuẩn = 0.1, tối ưu dựa trên dữ liệu"""
-        try:
-            if not STATSMODELS_AVAILABLE:
-                st.warning("Statsmodels không khả dụng")
-                return None
-            
-            # Nếu không tối ưu và không có alpha, dùng 0.1 (chuẩn)
-            if not optimize and alpha is None:
-                alpha = 0.1
-            
-            # Nếu tối ưu, tìm alpha tốt nhất DỰA VÀO DỮ LIỆU
-            if optimize:
-                best_alpha, best_sse = None, float('inf')
-                # Mở rộng phạm vi tìm kiếm từ 0.01 đến 0.99
-                for test_alpha in np.arange(0.01, 1.0, 0.1):
-                    try:
-                        model = ExponentialSmoothing(self.data, trend=None, seasonal=None, 
-                                                    initialization_method='estimated')
-                        fit = model.fit(smoothing_level=test_alpha, optimized=False)
-                        sse = np.sum(fit.resid ** 2)
-                        if sse < best_sse:
-                            best_sse, best_alpha = sse, test_alpha
-                    except: continue
-                alpha = best_alpha if best_alpha else 0.1
-                if alpha > 0.8:
-                    st.warning(f"⚠️ Alpha tối ưu cao ({alpha:.3f}): Mô hình nhạy cảm với dữ liệu gần đây")
-                else:
-                    st.info(f"✅ Alpha tối ưu tìm được: {alpha:.3f}")
-            
-            # Fit model với alpha đã chọn
-            model = ExponentialSmoothing(self.data, trend=None, seasonal=None, 
-                                        initialization_method='estimated')
-            fit = model.fit(smoothing_level=alpha, optimized=False)
-            forecast_values = fit.forecast(steps)
-            residuals = fit.resid
-            std_residuals = np.std(residuals)
-            upper, lower = forecast_values + 1.96 * std_residuals, forecast_values - 1.96 * std_residuals
-            forecast_dates = pd.date_range(
-                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                periods=steps, freq='D')
-            errors = self.calculate_forecast_errors(self.data[1:], fit.fittedvalues[1:])
-            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper, 'lower': lower,
-                   'alpha': alpha, 'method': 'Simple Exponential Smoothing', 'errors': errors,
-                   'fitted': fit.fittedvalues}
-        except Exception as e:
-            st.error(f"Lỗi Simple ES: {e}")
-            return None
-    
-    def holt_forecast(self, steps=30, optimize=True, alpha=None, beta=None):
-        """PHẦN ĐÃ SỬA - Bỏ tham số bounds không hợp lệ"""
-        try:
-            if not STATSMODELS_AVAILABLE:
-                st.warning("Statsmodels không khả dụng")
-                return None
-            
-            model = ExponentialSmoothing(self.data, trend='add', seasonal=None, 
-                                        initialization_method='estimated')
-            
-            if optimize:
-                # TỐI ƯU HÓA DỰA VÀO DỮ LIỆU - KHÔNG DÙNG BOUNDS
-                best_alpha, best_beta, best_sse = None, None, float('inf')
-                for test_alpha in np.arange(0.05, 0.95, 0.1):
-                    for test_beta in np.arange(0.05, 0.95, 0.1):
-                        try:
-                            fit = model.fit(smoothing_level=test_alpha, smoothing_trend=test_beta, 
-                                          optimized=False)
-                            sse = np.sum(fit.resid ** 2)
-                            if sse < best_sse:
-                                best_sse, best_alpha, best_beta = sse, test_alpha, test_beta
-                        except: continue
-                alpha, beta = (best_alpha, best_beta) if best_alpha else (0.1, 0.1)
-                st.info(f"✅ Holt - Alpha: {alpha:.3f}, Beta: {beta:.3f}")
-            else:
-                alpha, beta = alpha or 0.1, beta or 0.1
-            
-            fit = model.fit(smoothing_level=alpha, smoothing_trend=beta, optimized=False)
-            forecast_values = fit.forecast(steps)
-            residuals = fit.resid
-            std_residuals = np.std(residuals)
-            upper = forecast_values + 1.96 * std_residuals * np.sqrt(np.arange(1, steps+1))
-            lower = forecast_values - 1.96 * std_residuals * np.sqrt(np.arange(1, steps+1))
-            forecast_dates = pd.date_range(
-                start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                periods=steps, freq='D')
-            errors = self.calculate_forecast_errors(self.data[1:], fit.fittedvalues[1:])
-            return {'values': forecast_values, 'dates': forecast_dates, 'upper': upper, 'lower': lower,
-                   'alpha': alpha, 'beta': beta, 'method': 'Holt (Double Exponential Smoothing)',
-                   'errors': errors, 'fitted': fit.fittedvalues, 'level': fit.level, 'trend': fit.trend}
-        except Exception as e:
-            st.error(f"Lỗi Holt: {e}")
-            return None
-    
-    def holt_winters_forecast(self, steps=30, seasonal_periods=12, 
-                             trend_type='add', seasonal_type='add', optimize=True):
-        """
-        Mô hình Holt-Winters (Triple Exponential Smoothing)
-        """
-        try:
-            if not STATSMODELS_AVAILABLE:
-                st.warning("Statsmodels không khả dụng")
-                return None
-            
-            # Lưu seasonal_periods vào biến local để tránh lỗi
-            _seasonal_periods = seasonal_periods
-            
-            # Kiểm tra dữ liệu đủ dài
-            if len(self.data) < 2 * _seasonal_periods:
-                # Điều chỉnh chu kỳ mùa vụ nếu dữ liệu quá ngắn
-                old_periods = _seasonal_periods
-                _seasonal_periods = max(4, len(self.data) // 3)
-                st.warning(f"Dữ liệu ngắn, điều chỉnh chu kỳ mùa vụ: {old_periods} → {_seasonal_periods}")
-            
-            results = {}
-            
-            # Danh sách các cấu hình cần thử
-            configs = []
-            
-            if optimize:
-                # Thử tất cả các kết hợp
-                for trend in ['add', 'mul']:
-                    for seasonal in ['add', 'mul']:
-                        configs.append((trend, seasonal, 'optimized'))
-            else:
-                # Chỉ dùng cấu hình cho trước
-                configs.append((trend_type, seasonal_type, 'standard'))
-            
-            for trend, seasonal, config_type in configs:
-                try:
-                    model = ExponentialSmoothing(
-                        self.data,
-                        trend=trend,
-                        seasonal=seasonal,
-                        seasonal_periods=_seasonal_periods,
-                        initialization_method='estimated'
-                    )
-                    
-                    # Fit với giới hạn tham số
-                    if optimize:
-                        fit = model.fit(
-                            optimized=True,
-                            use_brute=False
-                        )
-                    else:
-                        fit = model.fit(
-                            smoothing_level=0.1,  # alpha
-                            smoothing_trend=0.1,  # beta
-                            smoothing_seasonal=0.1,  # gamma
-                            optimized=False
-                        )
-                    
-                    forecast_values = fit.forecast(steps)
-                    
-                    # Khoảng tin cậy
-                    residuals = fit.resid
-                    std_residuals = np.std(residuals)
-                    
-                    upper = forecast_values + 1.96 * std_residuals
-                    lower = forecast_values - 1.96 * std_residuals
-                    
-                    forecast_dates = pd.date_range(
-                        start=pd.Timestamp(self.df['Date'].iloc[-1]) + pd.Timedelta(days=1),
-                        periods=steps
-                    )
-                    
-                    # Tính các chỉ số
-                    errors = self.calculate_forecast_errors(
-                        self.data[_seasonal_periods:],
-                        fit.fittedvalues[_seasonal_periods:]
-                    )
-                    
-                    # Lấy tham số
-                    alpha = fit.params.get('smoothing_level', None)
-                    beta = fit.params.get('smoothing_trend', None)
-                    gamma = fit.params.get('smoothing_seasonal', None)
-                    
-                    method_name = f"Holt-Winters ({config_type.title()})"
-                    if config_type == 'optimized':
-                        method_name = f"Holt-Winters (Trend:{trend}, Seasonal:{seasonal})"
-                    
-                    results[method_name] = {
-                        'values': forecast_values,
-                        'dates': forecast_dates,
-                        'upper': upper,
-                        'lower': lower,
-                        'alpha': alpha,
-                        'beta': beta,
-                        'gamma': gamma,
-                        'trend_type': trend,
-                        'seasonal_type': seasonal,
-                        'seasonal_periods': _seasonal_periods,
-                        'method': method_name,
-                        'errors': errors,
-                        'fitted': fit.fittedvalues,
-                        'aic': fit.aic,
-                        'bic': fit.bic
-                    }
-                    
-                    st.success(f"{method_name} - AIC: {fit.aic:.2f}, α={alpha:.3f}, β={beta:.3f}, γ={gamma:.3f}")
-                    
-                except Exception as e:
-                    st.warning(f"Không thể fit {trend}/{seasonal}: {str(e)}")
-                    continue
-            
-            return results
-            
-        except Exception as e:
-            st.error(f"Lỗi Holt-Winters: {e}")
-            return None
-    
-    def prophet_forecast(self, steps=30):
-        """
-        Mô hình Facebook Prophet
-        """
-        try:
-            if not PROPHET_AVAILABLE:
-                st.warning("Prophet không khả dụng")
-                return None
-            
-            # Chuẩn bị dữ liệu
-            prophet_df = self.df[['Date', 'Close']].copy()
-            prophet_df.columns = ['ds', 'y']
-            
-            # Đảm bảo kiểu dữ liệu chính xác
-            prophet_df['ds'] = pd.to_datetime(prophet_df['ds'])
-            prophet_df['y'] = prophet_df['y'].astype(float)
-            
-            # Tạo model
-            model = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=True,
-                daily_seasonality=False,
-                changepoint_prior_scale=0.05,
-                seasonality_prior_scale=10.0,
-                interval_width=0.95
-            )
-            
-            # Thêm tính mùa vụ tháng
-            model.add_seasonality(
-                name='monthly',
-                period=30.5,
-                fourier_order=5
-            )
-            
-            # Fit model
-            model.fit(prophet_df)
-            
-            # Tạo future dataframe
-            future = model.make_future_dataframe(periods=steps)
-            
-            # Dự báo
-            forecast = model.predict(future)
-            
-            # Lấy phần dự báo tương lai
-            future_forecast = forecast.tail(steps)
-            
-            # Tính các chỉ số từ dữ liệu lịch sử
-            historical_forecast = forecast.head(len(self.data))
-            errors = self.calculate_forecast_errors(
-                self.data,
-                historical_forecast['yhat'].values
-            )
-            
-            return {
-                'values': future_forecast['yhat'].values,
-                'dates': pd.to_datetime(future_forecast['ds'].values),
-                'upper': future_forecast['yhat_upper'].values,
-                'lower': future_forecast['yhat_lower'].values,
-                'method': 'Facebook Prophet',
-                'model': model,
-                'forecast_full': forecast,
-                'errors': errors,
-                'trend': future_forecast['trend'].values,
-                'seasonal': future_forecast['yearly'].values if 'yearly' in future_forecast.columns else None
-            }
-            
-        except Exception as e:
-            st.error(f"Lỗi Prophet: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-            return None
-
-def display_forecast_metrics(forecast_result, model_name):
-    """Hiển thị các chỉ số đo độ lệch của mô hình"""
-    if forecast_result and 'errors' in forecast_result:
-        errors = forecast_result['errors']
-        
-        st.markdown(f"#### 📊 Chỉ số đo độ lệch - {model_name}")
-        
-        col1, col2, col3, col4, col5 = st.columns(5)
-        
-        with col1:
-            st.metric("MAE", f"{errors['MAE']:.4f}", 
-                     help="Mean Absolute Error - Sai số tuyệt đối trung bình")
-        
-        with col2:
-            st.metric("MSE", f"{errors['MSE']:.4f}",
-                     help="Mean Squared Error - Sai số bình phương trung bình")
-        
-        with col3:
-            st.metric("RMSE", f"{errors['RMSE']:.4f}",
-                     help="Root Mean Squared Error - Căn bậc hai của MSE")
-        
-        with col4:
-            st.metric("MAPE", f"{errors['MAPE']:.2f}%",
-                     help="Mean Absolute Percentage Error - Sai số phần trăm tuyệt đối")
-        
-        with col5:
-            st.metric("MPE", f"{errors['MPE']:.2f}%",
-                     help="Mean Percentage Error - Sai số phần trăm trung bình")
-        
-        # Đánh giá chất lượng dự báo
-        if errors['MAPE'] < 10:
-            quality = "🟢 Rất tốt"
-        elif errors['MAPE'] < 20:
-            quality = "🟡 Tốt"
-        elif errors['MAPE'] < 50:
-            quality = "🟠 Chấp nhận được"
-        else:
-            quality = "🔴 Kém"
-        
-        st.markdown(f"**Chất lượng dự báo:** {quality}")
-
 # ==================== TRANG CHỦ ====================
 if menu == "🏠 Trang chủ":
     st.markdown('<div class="main-header" style="color: white;">📊 Phân tích tổng quan cổ phiếu</div>', unsafe_allow_html=True)
     
-    col1, col2, col3 = st.columns([2, 2, 2])
-    
-    with col1:
-        stock_symbol = st.selectbox("Mã chứng khoán", ["COP", "CVX", "FANG", "SLB", "XOM"], 
-                                   help="Chọn mã chứng khoán từ danh sách có sẵn")
-    
-    with col2:
-        start_date = st.date_input("Ngày bắt đầu", value=datetime(2019, 12, 14))
-    
-    with col3:
-        end_date = st.date_input("Ngày kết thúc", value=datetime.now())
+    # Chọn mã cổ phiếu
+    selected_symbol = st.selectbox("Chọn mã cổ phiếu", list(file_options.keys()))
+    selected_file = file_options[selected_symbol]
     
     if st.button("🔍 Phân tích", type="primary"):
-        st.cache_data.clear()
-        with st.spinner("Đang tải dữ liệu..."):
-            df = load_stock_data(stock_symbol, start_date, end_date)
+        with st.spinner("Đang tải và xử lý dữ liệu..."):
+            df = load_data_file(selected_file)
             
             if df is not None and not df.empty:
                 st.success(f"✅ Đã tải {len(df)} bản ghi dữ liệu")
@@ -1058,17 +1008,17 @@ if menu == "🏠 Trang chủ":
                 
                 with info_col1:
                     st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                    st.metric("Mã chứng khoán", stock_symbol)
+                    st.metric("Mã chứng khoán", selected_symbol)
                     st.markdown('</div>', unsafe_allow_html=True)
                 
                 with info_col2:
                     st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                    st.metric("Ngày bắt đầu", start_date.strftime("%Y/%m/%d"))
+                    st.metric("Ngày bắt đầu", df['Date'].min().strftime("%Y/%m/%d"))
                     st.markdown('</div>', unsafe_allow_html=True)
                 
                 with info_col3:
                     st.markdown('<div class="metric-card">', unsafe_allow_html=True)
-                    st.metric("Ngày kết thúc", end_date.strftime("%Y/%m/%d"))
+                    st.metric("Ngày kết thúc", df['Date'].max().strftime("%Y/%m/%d"))
                     st.markdown('</div>', unsafe_allow_html=True)
                 
                 # Dữ liệu nguồn
@@ -1119,7 +1069,7 @@ if menu == "🏠 Trang chủ":
                 
                 fig.update_layout(
                     height=600,
-                    title_text="Biến động giá và khối lượng giao dịch",
+                    title_text=f"Biến động giá và khối lượng giao dịch {selected_symbol}",
                     showlegend=True
                 )
                 fig.update_xaxes(title_text="Thời gian", row=2, col=1)
@@ -1127,9 +1077,8 @@ if menu == "🏠 Trang chủ":
                 fig.update_yaxes(title_text="Khối lượng", row=2, col=1)
                 
                 st.plotly_chart(fig, use_container_width=True)
-                
             else:
-                st.error("❌ Không thể tải dữ liệu. Vui lòng kiểm tra mã chứng khoán!")
+                st.error("❌ Không thể tải dữ liệu. Vui lòng kiểm tra file!")
 
 # ==================== TRANG DỰ BÁO ====================
 elif menu == "📈 Dự báo":
@@ -1140,8 +1089,7 @@ elif menu == "📈 Dự báo":
         col1, col2, col3, col4, col5 = st.columns(5)
         
         with col1:
-            symbol = st.selectbox("Mã chứng khoán", ["COP", "CVX", "FANG", "SLB", "XOM"], 
-                                 key="forecast_symbol")
+            selected_symbol = st.selectbox("Mã cổ phiếu", list(file_options.keys()))
         
         with col2:
             forecast_days = st.slider("Chu kì dự báo", 7, 730, 180, 
@@ -1160,7 +1108,7 @@ elif menu == "📈 Dự báo":
                 ["Ngày", "Tuần", "Tháng"],
                 index=0,
                 help="Chọn đơn vị thời gian cho dự báo"
-            )
+                )
 
     # Chuyển đổi số ngày dự báo dựa trên khung thời gian
         if forecast_timeframe == "Tuần":
@@ -1171,36 +1119,35 @@ elif menu == "📈 Dự báo":
             actual_forecast_days = forecast_days
     
     # CHỌN MÔ HÌNH DỰ BÁO
-    
     st.markdown("### 🎯 Cấu hình dự báo")
 
     # Thiết lập mặc định cho tất cả các mô hình
     model_options = ["Moving Average", "Exponential Smoothing", "Holt", "Holt-Winters", "Prophet"]
     model_config = {
         'MA': {
-            'windows': [3, 6, 9, 12, 24],
-            'use_wma': False,
-            'use_naive': True,
-            'use_drift': True
-        },
+           'windows': [3, 6, 9, 12, 24],
+           'use_wma': False,
+           'use_naive': True,
+           'use_drift': True
+           },
         'ES': {
-            'alpha': None,
-            'optimize': True
+        'alpha': None,
+        'optimize': True
         },
-        'Holt': {
-            'optimize': True,
-            'alpha': None,
-            'beta': None
-        },
+         'Holt': {
+        'optimize': True,
+        'alpha': None,
+        'beta': None
+    },
         'HW': {
-            'seasonal_periods': 12,
-            'optimize': True,
-            'trend_type': 'add',
-            'seasonal_type': 'add'
-        },
+        'seasonal_periods': 12,
+        'optimize': True,
+        'trend_type': 'add',
+        'seasonal_type': 'add'
+    },
         'Prophet': {
-            'include_history': True
-        }
+        'include_history': True
+    }
     }
 
     # Chọn kiểu biểu đồ
@@ -1217,14 +1164,12 @@ elif menu == "📈 Dự báo":
     # CHẠY DỰ BÁO
     if st.button("🚀 Chạy phân tích và dự báo", type="primary", use_container_width=True):
         with st.spinner("⏳ Đang tải dữ liệu và tính toán dự báo..."):
-            # Tải dữ liệu
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=365*5)  # Tăng lên 5 năm để có đủ dữ liệu
-            
-            df = load_stock_data(symbol, start_date, end_date)
+            # Tải dữ liệu từ file đã chọn
+            selected_file = file_options[selected_symbol]
+            df = load_data_file(selected_file)
             
             if df is not None and len(df) > 30:
-                st.success(f"✅ Đã tải {len(df)} ngày dữ liệu cho {symbol}")
+                st.success(f"✅ Đã tải {len(df)} ngày dữ liệu cho {selected_symbol}")
                 
                 # Thông tin tổng quan
                 st.markdown("## 📊 Thông tin tổng quan")
@@ -1385,13 +1330,12 @@ elif menu == "📈 Dự báo":
                 status_text.text("✅ Hoàn thành!")
                 
                 if all_forecasts:
-                    # Tạo các hàm vẽ biểu đồ theo kiểu mẫu
-                    
-                    # 1. Hàm vẽ biểu đồ kiểu Prophet
+                    # Hàm vẽ biểu đồ kiểu Prophet
                     def plot_prophet_style(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
                         point_color = 'white' if is_dark else 'black'
-                        text_color = 'white' if is_dark else 'black'  # Màu chữ thay đổi theo chế độ
+                        text_color = 'white' if is_dark else 'black'
+                        
                         fig = go.Figure()
                         
                         # Thêm đường giá gốc (đường liên tục)
@@ -1402,6 +1346,7 @@ elif menu == "📈 Dự báo":
                             name='Giá thực tế',
                             line=dict(color='blue', width=2)
                         ))
+                        
                         # Dữ liệu lịch sử dạng chấm đen
                         fig.add_trace(go.Scatter(
                             x=df['Date'], 
@@ -1409,11 +1354,11 @@ elif menu == "📈 Dự báo":
                             mode='markers',
                             name='Observed data points',
                             marker=dict(
-                                color='white' if is_dark_mode() else 'blue',  # Màu điểm thay đổi theo chế độ
+                                color='white' if is_dark else 'blue',
                                 size=4,
                                 line=dict(
                                     width=1, 
-                                    color='#1f77b4' if not is_dark_mode() else '#5fafff'
+                                    color='#1f77b4' if not is_dark else '#5fafff'
                                 )
                             )
                         ))
@@ -1469,19 +1414,17 @@ elif menu == "📈 Dự báo":
                             yshift=10,
                             font=dict(color="#1f77b4") 
                         )
-                      
+                        
                         # Chú thích cho giá trị cuối cùng và dự báo cuối
                         fig.add_annotation(
                             x=last_date,
-                            y=df['Close'].max(),
-                            xref="x",
-                            yref="y",
-                            text="Start of Forecast",
+                            y=df['Close'].iloc[-1],
+                            text=f"Last Value: {df['Close'].iloc[-1]:.2f}",
                             showarrow=True,
                             arrowhead=1,
                             ax=40,
                             ay=-40,
-                            font=dict(color='white' if "plotly_dark" in fig.layout.template else 'black')
+                            font=dict(color='white' if is_dark else 'black')
                         )
                         
                         end_forecast = float(forecast_result['values'][-1])
@@ -1494,25 +1437,23 @@ elif menu == "📈 Dự báo":
                             arrowhead=1,
                             ax=-40,
                             ay=-40,
-                            font=dict(color='white' if is_dark_mode() else 'black')
+                            font=dict(color='white' if is_dark else 'black')
                         )
                         
                         fig.update_layout(
-                            title="Time Series Forecast with Prophet",
+                            title=f"Time Series Forecast for {selected_symbol} with {model_name}",
                             xaxis_title="Date",
                             yaxis_title="Adjusted Close Price",
                             legend_title="Legend",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
                         )
-                        return fig 
-                       
+                        return fig
                     
-                    # 2. Hàm vẽ biểu đồ kiểu Holt-Winters (Tối ưu)
+                    # Hàm vẽ biểu đồ kiểu Holt-Winters (Tối ưu)
                     def plot_holt_winters_optimized(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
-                        template="plotly_white" if not is_dark else "plotly_dark"
-
+                        
                         fig = go.Figure()
                         
                         # Chia dữ liệu thành train/test
@@ -1557,21 +1498,20 @@ elif menu == "📈 Dự báo":
                         ))
                         
                         fig.update_layout(
-                            title="Dự báo Holt-Winters (Hệ số tối ưu)",
+                            title=f"Dự báo Holt-Winters (Hệ số tối ưu) cho {selected_symbol}",
                             xaxis_title="Ngày",
                             yaxis_title="Giá",
                             legend_title="Legend",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
                     
-                    # 3. Hàm vẽ biểu đồ kiểu Holt-Winters (Tiêu chuẩn)
+                    # Hàm vẽ biểu đồ kiểu Holt-Winters (Tiêu chuẩn)
                     def plot_holt_winters_standard(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
-
+                        
                         fig = go.Figure()
                         
                         # Chia dữ liệu thành train/test
@@ -1635,27 +1575,26 @@ elif menu == "📈 Dự báo":
                                     text=f"RMSE cho mô hình hệ số tiêu chuẩn: {rmse_standard:.4f}<br>RMSE cho mô hình tối ưu: {rmse_optimized:.4f}",
                                     showarrow=False,
                                     align="left",
-                                    bgcolor="white",
-                                    bordercolor="black",
+                                    bgcolor="white" if not is_dark else "black",
+                                    bordercolor="black" if not is_dark else "white",
                                     borderwidth=1
                                 )
                         
                         fig.update_layout(
-                            title="Dự báo Holt-Winters (Hệ số tiêu chuẩn)",
+                            title=f"Dự báo Holt-Winters (Hệ số tiêu chuẩn) cho {selected_symbol}",
                             xaxis_title="Ngày",
                             yaxis_title="Giá",
                             legend_title="Legend",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
                     
-                    # 4. Hàm vẽ biểu đồ kiểu Holt (Tham số cố định)
+                    # Hàm vẽ biểu đồ kiểu Holt (Tham số cố định)
                     def plot_holt_fixed(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
-
+                        
                         fig = go.Figure()
                         
                         # Dữ liệu gốc
@@ -1663,7 +1602,7 @@ elif menu == "📈 Dự báo":
                             x=df['Date'], 
                             y=df['Close'],
                             mode='lines',
-                            name='Data COP',
+                            name=f'Data {selected_symbol}',
                             line=dict(color='blue', width=2)
                         ))
                         
@@ -1672,55 +1611,54 @@ elif menu == "📈 Dự báo":
                         train_data = df.iloc[:train_size]
                         test_data = df.iloc[train_size:]
                         
-                        # Train COP
+                        # Train
                         fig.add_trace(go.Scatter(
                             x=train_data['Date'], 
                             y=train_data['Close'],
                             mode='lines',
-                            name='Train COP',
+                            name=f'Train {selected_symbol}',
                             line=dict(color='blue', width=2),
                             showlegend=False
                         ))
                         
-                        # Test COP
+                        # Test
                         fig.add_trace(go.Scatter(
                             x=test_data['Date'], 
                             y=test_data['Close'],
                             mode='lines',
-                            name='Test COP',
+                            name=f'Test {selected_symbol}',
                             line=dict(color="#ff001e", width=2)
                         ))
                         
-                        # HOLT COP fixed
+                        # HOLT fixed
                         fig.add_trace(go.Scatter(
                             x=forecast_result['dates'], 
                             y=forecast_result['values'],
                             mode='lines',
-                            name='HOLT COP fixed (α=0.10, β=0.20)',
+                            name=f'HOLT {selected_symbol} fixed (α=0.10, β=0.20)',
                             line=dict(color='green', width=2, dash='dash')
                         ))
                         
                         fig.update_layout(
-                            title="Holt Forecast COP (Fixed Params)",
+                            title=f"Holt Forecast {selected_symbol} (Fixed Params)",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
                     
-                    # 5. Hàm vẽ biểu đồ kiểu Holt (Tham số tối ưu)
+                    # Hàm vẽ biểu đồ kiểu Holt (Tham số tối ưu)
                     def plot_holt_optimized(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
-
+                        
                         fig = go.Figure()
                         
-                        # Dữ liệu gốc COP
+                        # Dữ liệu gốc
                         fig.add_trace(go.Scatter(
                             x=df['Date'], 
                             y=df['Close'],
                             mode='lines',
-                            name='Dữ liệu gốc COP',
+                            name=f'Dữ liệu gốc {selected_symbol}',
                             line=dict(color='blue', width=2)
                         ))
                         
@@ -1729,22 +1667,22 @@ elif menu == "📈 Dự báo":
                         train_data = df.iloc[:train_size]
                         test_data = df.iloc[train_size:]
                         
-                        # Dữ liệu huấn luyện COP
+                        # Dữ liệu huấn luyện
                         fig.add_trace(go.Scatter(
                             x=train_data['Date'], 
                             y=train_data['Close'],
                             mode='lines',
-                            name='Dữ liệu huấn luyện COP',
+                            name=f'Dữ liệu huấn luyện {selected_symbol}',
                             line=dict(color='blue', width=2),
                             showlegend=False
                         ))
                         
-                        # Dữ liệu kiểm tra COP
+                        # Dữ liệu kiểm tra
                         fig.add_trace(go.Scatter(
                             x=test_data['Date'], 
                             y=test_data['Close'],
                             mode='lines',
-                            name='Dữ liệu kiểm tra COP',
+                            name=f'Dữ liệu kiểm tra {selected_symbol}',
                             line=dict(color="#ff001e", width=2)
                         ))
                         
@@ -1752,30 +1690,29 @@ elif menu == "📈 Dự báo":
                         alpha = forecast_result.get('alpha', 0.20)
                         beta = forecast_result.get('beta', 0.10)
                         
-                        # Dự báo HOLT COP tối ưu
+                        # Dự báo HOLT tối ưu
                         fig.add_trace(go.Scatter(
                             x=forecast_result['dates'], 
                             y=forecast_result['values'],
                             mode='lines',
-                            name=f'Dự báo HOLT COP (Grid Optimized Alpha={alpha:.2f}, Beta={beta:.2f})',
+                            name=f'Dự báo HOLT {selected_symbol} (Grid Optimized Alpha={alpha:.2f}, Beta={beta:.2f})',
                             line=dict(color='orange', width=2, dash='dash')
                         ))
                         
                         fig.update_layout(
-                            title="Dự báo Mô hình HOLT COP (Tham số tối ưu từ Grid Search)",
+                            title=f"Dự báo Mô hình HOLT {selected_symbol} (Tham số tối ưu từ Grid Search)",
                             xaxis_title="Ngày (Date)",
                             yaxis_title="Đơn vị ($)",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
                     
-                    # 6. Hàm vẽ biểu đồ kiểu SES (Alpha tối ưu)
+                    # Hàm vẽ biểu đồ kiểu SES (Alpha tối ưu)
                     def plot_ses_optimized(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
-
+                        
                         fig = go.Figure()
                         
                         # Giá đóng cửa gốc
@@ -1817,15 +1754,14 @@ elif menu == "📈 Dự báo":
                             yaxis_title="Adj Close Value",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
                     
-                    # 7. Hàm vẽ biểu đồ kiểu SES (Alpha cố định)
+                    # Hàm vẽ biểu đồ kiểu SES (Alpha cố định)
                     def plot_ses_fixed(forecast_result, df, model_name):
                         is_dark = is_dark_mode()
-
+                        
                         fig = go.Figure()
                         
                         # Giá đóng cửa gốc
@@ -1864,15 +1800,14 @@ elif menu == "📈 Dự báo":
                             yaxis_title="Adj Close Value",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
                     
-                    # 8. Hàm vẽ biểu đồ kiểu Moving Average
+                    # Hàm vẽ biểu đồ kiểu Moving Average
                     def plot_moving_averages(df):
                         is_dark = is_dark_mode()
-
+                        
                         fig = go.Figure()
                         
                         # Giá đóng cửa gốc
@@ -1915,12 +1850,11 @@ elif menu == "📈 Dự báo":
                         ))
                         
                         fig.update_layout(
-                            title="Giá đóng cửa đã điều chỉnh và đường trung bình động của COP",
+                            title=f"Giá đóng cửa đã điều chỉnh và đường trung bình động của {selected_symbol}",
                             xaxis_title="Năm",
                             yaxis_title="Giá",
                             height=600,
                             template="plotly_white" if not is_dark else "plotly_dark"
-
                         )
                         
                         return fig
@@ -1943,7 +1877,7 @@ elif menu == "📈 Dự báo":
                     elif viz_style == "Biểu đồ Holt-Winters (Tối ưu)":
                         hw_model = None
                         for model_name in all_forecasts:
-                            if 'Holt-Winters' in model_name and ('standard' in model_name.lower() or 'tiêu chuẩn' in model_name.lower() or 'Hệ số tiêu chuẩn' in model_name):
+                            if 'Holt-Winters' in model_name and 'optimized' in model_name.lower():
                                 hw_model = model_name
                                 break
                         
@@ -2109,7 +2043,7 @@ elif menu == "📈 Dự báo":
                         line_dash="dash",
                         line_color="red"
                     )
-
+                    
                     # Thêm annotation riêng
                     fig_compare.add_annotation(
                         x=last_date,
@@ -2120,15 +2054,13 @@ elif menu == "📈 Dự báo":
                         showarrow=False,
                         yshift=10           # nhích annotation lên một chút
                     )
-                        
                     
                     fig_compare.update_layout(
-                        title=f"So sánh các mô hình dự báo cho {symbol}",
+                        title=f"So sánh các mô hình dự báo cho {selected_symbol}",
                         xaxis_title="Ngày",
                         yaxis_title="Giá",
                         height=600,
-                        template="plotly_white"
-
+                        template="plotly_white" if not is_dark_mode() else "plotly_dark"
                     )
                     
                     st.plotly_chart(fig_compare, use_container_width=True)
@@ -2167,8 +2099,7 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
     
     col1, col2 = st.columns(2)
     with col1:
-        adv_symbol = st.selectbox("Mã chứng khoán", ["COP", "CVX", "FANG", "SLB", "XOM"], 
-                                 help="Chọn mã chứng khoán từ danh sách có sẵn")
+        selected_symbol = st.selectbox("Mã chứng khoán", list(file_options.keys()))
     
     with col2:
         display_period = st.selectbox(
@@ -2176,12 +2107,6 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
             ["1 tháng", "3 tháng", "6 tháng", "1 năm", "2 năm", "5 năm"],
             index=3
         )
-        
-        period_map = {
-            "1 tháng": "1mo", "3 tháng": "3mo", "6 tháng": "6mo",
-            "1 năm": "1y", "2 năm": "2y", "5 năm": "5y"
-        }
-        selected_code = period_map[display_period]
     
     st.markdown("### 🔧 Lựa chọn chỉ báo kỹ thuật")
     
@@ -2245,22 +2170,9 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
     if st.button("🚀 Phân tích kỹ thuật", type="primary"):
         with st.spinner("Đang xử lý dữ liệu và tính toán chỉ số..."):
             try:
-                # Tải dữ liệu từ file CSV
-                end_date = datetime.now()
-                
-                # Xác định start_date dựa trên display_period
-                period_days = {
-                    "1 tháng": 30,
-                    "3 tháng": 90,
-                    "6 tháng": 180,
-                    "1 năm": 365,
-                    "2 năm": 730,
-                    "5 năm": 1825
-                }
-                
-                start_date = end_date - timedelta(days=period_days[display_period])
-                
-                df = load_stock_data(adv_symbol, start_date, end_date)
+                # Tải dữ liệu từ file đã chọn
+                selected_file = file_options[selected_symbol]
+                df = load_data_file(selected_file)
                 
                 if df is None or df.empty:
                     st.error("❌ Không có dữ liệu cho mã chứng khoán này.")
@@ -2269,7 +2181,20 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                     analyzer = TechnicalAnalyzer(df)
                     df_view = analyzer.df
                     
-                    st.success(f"✅ Đã phân tích chỉ số kỹ thuật cho **{adv_symbol.upper()}**")
+                    # Lọc dữ liệu hiển thị theo khung thời gian
+                    if display_period == "1 tháng":
+                        df_view = df_view.tail(30)
+                    elif display_period == "3 tháng":
+                        df_view = df_view.tail(90)
+                    elif display_period == "6 tháng":
+                        df_view = df_view.tail(180)
+                    elif display_period == "1 năm":
+                        df_view = df_view.tail(365)
+                    elif display_period == "2 năm":
+                        df_view = df_view.tail(730)
+                    # 5 năm sẽ hiển thị tất cả dữ liệu
+                    
+                    st.success(f"✅ Đã phân tích chỉ số kỹ thuật cho **{selected_symbol}**")
                     
                     # THỐNG KÊ TỔNG QUAN
                     st.markdown("### 📈 Thống kê tổng quan")
@@ -2409,15 +2334,15 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                     if show_candlestick:
                         fig.add_trace(
                             go.Candlestick(
-                                x=df_view['Date'],
-                                open=df_view['Open'], 
-                                high=df_view['High'],
-                                low=df_view['Low'], 
-                                close=df_view['Close'],
-                                name='Giá',
-                                increasing_line_color='#26a69a',
-                                decreasing_line_color='#ef5350'
-                            ), row=current_row, col=1)
+                            x=df_view['Date'],
+                            open=df_view['Open'], 
+                            high=df_view['High'],
+                            low=df_view['Low'], 
+                            close=df_view['Close'],
+                            name='Giá',
+                            increasing_line_color='#26a69a',
+                            decreasing_line_color='#ef5350'
+                        ), row=current_row, col=1)
                     else:
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
@@ -2467,55 +2392,61 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                             name='Bollinger Bands',
                             line=dict(color='gray', width=1, dash='dash'),
                             fill='tonexty',
-                            fillcolor='rgba(128, 128, 128, 0.1)'
+                            fillcolor='rgba(128, 128, 128, 0.2)'
                         ), row=current_row, col=1)
                     
-                    # Support/Resistance
+                    # SUPPORT/RESISTANCE
                     if use_support_resistance and 'Support' in df_view.columns:
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
                             y=df_view['Support'],
                             name='Support',
-                            line=dict(color='green', width=1, dash='dot'),
-                            opacity=0.5
+                            line=dict(color='green', width=1, dash='dash')
                         ), row=current_row, col=1)
                         
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
                             y=df_view['Resistance'],
                             name='Resistance',
-                            line=dict(color='red', width=1, dash='dot'),
-                            opacity=0.5
+                            line=dict(color='red', width=1, dash='dash')
                         ), row=current_row, col=1)
                     
-                    fig.update_yaxes(title_text="Giá (USD)", row=current_row, col=1)
                     current_row += 1
                     
                     # VOLUME
-                    if use_volume or use_obv:
-                        if use_volume and 'Volume' in df_view.columns:
-                            colors_volume = ['#ef5350' if row['Close'] < row['Open'] else '#26a69a' 
-                                           for _, row in df_view.iterrows()]
-                            
+                    if (use_volume or use_obv) and 'Volume' in df_view.columns:
+                        if use_volume:
                             fig.add_trace(go.Bar(
                                 x=df_view['Date'], 
                                 y=df_view['Volume'],
                                 name='Volume',
-                                marker_color=colors_volume,
-                                opacity=0.7,
-                                showlegend=True
+                                marker_color='rgba(0, 0, 255, 0.7)'
                             ), row=current_row, col=1)
+                            
+                            if 'Volume_SMA_20' in df_view.columns:
+                                fig.add_trace(go.Scatter(
+                                    x=df_view['Date'], 
+                                    y=df_view['Volume_SMA_20'],
+                                    name='Volume SMA 20',
+                                    line=dict(color='orange', width=1.5, dash='dash')
+                                ), row=current_row, col=1)
                         
                         if use_obv and 'OBV' in df_view.columns:
                             fig.add_trace(go.Scatter(
                                 x=df_view['Date'], 
                                 y=df_view['OBV'],
                                 name='OBV',
-                                line=dict(color='purple', width=2),
-                                yaxis='y2'
+                                line=dict(color='purple', width=1.5)
                             ), row=current_row, col=1)
                         
-                        fig.update_yaxes(title_text="Volume", row=current_row, col=1)
+                        if use_vpt and 'VPT' in df_view.columns:
+                            fig.add_trace(go.Scatter(
+                                x=df_view['Date'], 
+                                y=df_view['VPT'],
+                                name='VPT',
+                                line=dict(color='green', width=1.5)
+                            ), row=current_row, col=1)
+                        
                         current_row += 1
                     
                     # RSI
@@ -2524,19 +2455,28 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                             x=df_view['Date'], 
                             y=df_view['RSI'],
                             name='RSI',
-                            line=dict(color='purple', width=2)
+                            line=dict(color='blue', width=1.5)
                         ), row=current_row, col=1)
                         
-                        fig.add_hline(y=70, line_dash="dash", line_color="red", 
-                                     annotation_text="Quá mua", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=30, line_dash="dash", line_color="green",
-                                     annotation_text="Quá bán", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=50, line_dash="dot", line_color="gray", 
-                                     row=current_row, col=1)
+                        # Thêm đường tham chiếu RSI
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=70, y1=70,
+                            line=dict(color="red", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
                         
-                        fig.update_yaxes(title_text="RSI", range=[0, 100], row=current_row, col=1)
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=30, y1=30,
+                            line=dict(color="green", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
+                        
                         current_row += 1
                     
                     # MACD
@@ -2545,53 +2485,63 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                             x=df_view['Date'], 
                             y=df_view['MACD'],
                             name='MACD',
-                            line=dict(color='blue', width=2)
+                            line=dict(color='blue', width=1.5)
                         ), row=current_row, col=1)
                         
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
                             y=df_view['Signal_Line'],
                             name='Signal Line',
-                            line=dict(color='orange', width=1.5)
+                            line=dict(color='red', width=1.5, dash='dash')
                         ), row=current_row, col=1)
                         
-                        colors_macd = ['#ef5350' if val < 0 else '#26a69a' 
-                                     for val in df_view['MACD_Histogram']]
+                        # MACD Histogram
+                        colors = ['green' if val > 0 else 'red' for val in df_view['MACD_Histogram']]
+                        
                         fig.add_trace(go.Bar(
                             x=df_view['Date'], 
                             y=df_view['MACD_Histogram'],
                             name='MACD Histogram',
-                            marker_color=colors_macd,
-                            opacity=0.5
+                            marker_color=colors
                         ), row=current_row, col=1)
                         
-                        fig.update_yaxes(title_text="MACD", row=current_row, col=1)
                         current_row += 1
                     
-                    # STOCHASTIC
+                    # Stochastic
                     if use_stoch and 'Stoch_%K' in df_view.columns:
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
                             y=df_view['Stoch_%K'],
-                            name='Stochastic %K',
-                            line=dict(color='deepskyblue', width=2)
+                            name='%K',
+                            line=dict(color='blue', width=1.5)
                         ), row=current_row, col=1)
                         
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
                             y=df_view['Stoch_%D'],
-                            name='Stochastic %D',
-                            line=dict(color='orange', width=1.5, dash='dash')
+                            name='%D',
+                            line=dict(color='red', width=1.5, dash='dash')
                         ), row=current_row, col=1)
                         
-                        fig.add_hline(y=80, line_dash="dash", line_color="red",
-                                     annotation_text="Quá mua", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=20, line_dash="dash", line_color="green",
-                                     annotation_text="Quá bán", annotation_position="right",
-                                     row=current_row, col=1)
+                        # Thêm đường tham chiếu Stochastic
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=80, y1=80,
+                            line=dict(color="red", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
                         
-                        fig.update_yaxes(title_text="Stochastic", range=[0, 100], row=current_row, col=1)
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=20, y1=20,
+                            line=dict(color="green", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
+                        
                         current_row += 1
                     
                     # ATR
@@ -2600,10 +2550,9 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                             x=df_view['Date'], 
                             y=df_view['ATR'],
                             name='ATR',
-                            line=dict(color='brown', width=2)
+                            line=dict(color='purple', width=1.5)
                         ), row=current_row, col=1)
                         
-                        fig.update_yaxes(title_text="ATR", row=current_row, col=1)
                         current_row += 1
                     
                     # ADX
@@ -2612,30 +2561,34 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                             x=df_view['Date'], 
                             y=df_view['ADX'],
                             name='ADX',
-                            line=dict(color='black', width=2)
+                            line=dict(color='black', width=1.5)
                         ), row=current_row, col=1)
                         
-                        if '+DI' in df_view.columns:
+                        if '+DI' in df_view.columns and '-DI' in df_view.columns:
                             fig.add_trace(go.Scatter(
                                 x=df_view['Date'], 
                                 y=df_view['+DI'],
                                 name='+DI',
-                                line=dict(color='green', width=1.5)
+                                line=dict(color='green', width=1.5, dash='dash')
                             ), row=current_row, col=1)
-                        
-                        if '-DI' in df_view.columns:
+                            
                             fig.add_trace(go.Scatter(
                                 x=df_view['Date'], 
                                 y=df_view['-DI'],
                                 name='-DI',
-                                line=dict(color='red', width=1.5)
+                                line=dict(color='red', width=1.5, dash='dash')
                             ), row=current_row, col=1)
                         
-                        fig.add_hline(y=25, line_dash="dash", line_color="gray",
-                                     annotation_text="Xu hướng mạnh", annotation_position="right",
-                                     row=current_row, col=1)
+                        # Thêm đường tham chiếu ADX
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=25, y1=25,
+                            line=dict(color="gray", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
                         
-                        fig.update_yaxes(title_text="ADX", row=current_row, col=1)
                         current_row += 1
                     
                     # CCI
@@ -2644,127 +2597,503 @@ elif menu == "📊 Chỉ số kỹ thuật nâng cao":
                             x=df_view['Date'], 
                             y=df_view['CCI'],
                             name='CCI',
-                            line=dict(color='teal', width=2)
+                            line=dict(color='blue', width=1.5)
                         ), row=current_row, col=1)
                         
-                        fig.add_hline(y=100, line_dash="dash", line_color="red",
-                                     annotation_text="Quá mua", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=-100, line_dash="dash", line_color="green",
-                                     annotation_text="Quá bán", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=0, line_dash="dot", line_color="gray",
-                                     row=current_row, col=1)
+                        # Thêm đường tham chiếu CCI
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=100, y1=100,
+                            line=dict(color="red", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
                         
-                        fig.update_yaxes(title_text="CCI", row=current_row, col=1)
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=-100, y1=-100,
+                            line=dict(color="green", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
+                        
                         current_row += 1
                     
-                    # WILLIAMS %R
+                    # Williams %R
                     if use_williams and 'Williams_%R' in df_view.columns:
                         fig.add_trace(go.Scatter(
                             x=df_view['Date'], 
                             y=df_view['Williams_%R'],
                             name='Williams %R',
-                            line=dict(color='darkviolet', width=2)
+                            line=dict(color='blue', width=1.5)
                         ), row=current_row, col=1)
                         
-                        fig.add_hline(y=-20, line_dash="dash", line_color="red",
-                                     annotation_text="Quá mua", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=-80, line_dash="dash", line_color="green",
-                                     annotation_text="Quá bán", annotation_position="right",
-                                     row=current_row, col=1)
-                        fig.add_hline(y=-50, line_dash="dot", line_color="gray",
-                                     row=current_row, col=1)
-                        
-                        fig.update_yaxes(title_text="Williams %R", range=[-100, 0], row=current_row, col=1)
-                        current_row += 1
-                    
-                    # CẬP NHẬT LAYOUT
-                    fig.update_layout(
-                        title=f"Phân tích chỉ số kỹ thuật: {adv_symbol.upper()} ({display_period})",
-                        height=200 * num_subplots,
-                        xaxis_rangeslider_visible=False,
-                        hovermode="x unified",
-                        template="plotly_white",
-                        legend=dict(
-                            orientation="h", 
-                            yanchor="bottom", 
-                            y=1.02, 
-                            xanchor="right", 
-                            x=1
-                        ),
-                        margin=dict(t=100, b=50)
-                    )
-                    
-                    fig.update_xaxes(
-                        title_text="Thời gian",
-                        row=num_subplots, 
-                        col=1,
-                        rangeslider_visible=False
-                    )
-                    
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # BẢNG DỮ LIỆU CHI TIẾT
-                    with st.expander("📥 Xem và xuất dữ liệu chi tiết"):
-                        # Chọn các cột để hiển thị
-                        display_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-                        
-                        if use_rsi and 'RSI' in df_view.columns:
-                            display_cols.append('RSI')
-                        if use_macd and 'MACD' in df_view.columns:
-                            display_cols.extend(['MACD', 'Signal_Line'])
-                        if use_stoch and 'Stoch_%K' in df_view.columns:
-                            display_cols.extend(['Stoch_%K', 'Stoch_%D'])
-                        if use_bb and 'BB_Upper' in df_view.columns:
-                            display_cols.extend(['BB_Upper', 'BB_Middle', 'BB_Lower'])
-                        if use_atr and 'ATR' in df_view.columns:
-                            display_cols.append('ATR')
-                        if use_adx and 'ADX' in df_view.columns:
-                            display_cols.extend(['ADX', '+DI', '-DI'])
-                        if use_cci and 'CCI' in df_view.columns:
-                            display_cols.append('CCI')
-                        if use_williams and 'Williams_%R' in df_view.columns:
-                            display_cols.append('Williams_%R')
-                        if use_obv and 'OBV' in df_view.columns:
-                            display_cols.append('OBV')
-                        
-                        # Lọc các cột tồn tại
-                        display_cols = [col for col in display_cols if col in df_view.columns]
-                        
-                        st.dataframe(df_view[display_cols].tail(50), use_container_width=True)
-                        
-                        csv = df_view[display_cols].to_csv(index=False)
-                        st.download_button(
-                            label="📥 Tải dữ liệu CSV",
-                            data=csv,
-                            file_name=f"{adv_symbol}_technical_indicators_{display_period}.csv",
-                            mime="text/csv"
+                        # Thêm đường tham chiếu Williams %R
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=-20, y1=-20,
+                            line=dict(color="red", width=1, dash="dash"),
+                            row=current_row, col=1
                         )
                         
+                        fig.add_shape(
+                            type="line",
+                            x0=df_view['Date'].iloc[0],
+                            x1=df_view['Date'].iloc[-1],
+                            y0=-80, y1=-80,
+                            line=dict(color="green", width=1, dash="dash"),
+                            row=current_row, col=1
+                        )
+                    
+                    # Cập nhật layout
+                    fig.update_layout(
+                        title=f"Phân tích kỹ thuật {selected_symbol} - {display_period}",
+                        xaxis_title="Ngày",
+                        height=200 * num_subplots,  # Điều chỉnh chiều cao dựa trên số lượng subplot
+                        legend_title="Chỉ báo",
+                        hovermode="x unified",
+                        template="plotly_white" if not is_dark_mode() else "plotly_dark"
+                    )
+                    
+                    # Hiển thị biểu đồ
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # BẢNG DỮ LIỆU CHỈ SỐ KỸ THUẬT
+                    st.markdown("### 📋 Bảng dữ liệu chỉ số kỹ thuật")
+                    
+                    # Chọn các cột hiển thị
+                    display_columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+                    
+                    if use_rsi and 'RSI' in df_view.columns:
+                        display_columns.append('RSI')
+                    
+                    if use_macd and 'MACD' in df_view.columns:
+                        display_columns.extend(['MACD', 'Signal_Line', 'MACD_Histogram'])
+                    
+                    if use_bb and 'BB_Upper' in df_view.columns:
+                        display_columns.extend(['BB_Upper', 'BB_Middle', 'BB_Lower'])
+                    
+                    if use_stoch and 'Stoch_%K' in df_view.columns:
+                        display_columns.extend(['Stoch_%K', 'Stoch_%D'])
+                    
+                    if use_sma and 'SMA_20' in df_view.columns:
+                        display_columns.append('SMA_20')
+                    
+                    if use_ema and 'EMA_12' in df_view.columns:
+                        display_columns.append('EMA_12')
+                    
+                    if use_atr and 'ATR' in df_view.columns:
+                        display_columns.append('ATR')
+                    
+                    if use_adx and 'ADX' in df_view.columns:
+                        display_columns.extend(['ADX', '+DI', '-DI'])
+                    
+                    if use_cci and 'CCI' in df_view.columns:
+                        display_columns.append('CCI')
+                    
+                    if use_williams and 'Williams_%R' in df_view.columns:
+                        display_columns.append('Williams_%R')
+                    
+                    # Hiển thị bảng dữ liệu
+                    st.dataframe(df_view[display_columns].tail(20).style.format({
+                        'Open': '${:.2f}',
+                        'High': '${:.2f}',
+                        'Low': '${:.2f}',
+                        'Close': '${:.2f}',
+                        'Volume': '{:,.0f}',
+                        'RSI': '{:.2f}',
+                        'MACD': '{:.4f}',
+                        'Signal_Line': '{:.4f}',
+                        'MACD_Histogram': '{:.4f}',
+                        'BB_Upper': '${:.2f}',
+                        'BB_Middle': '${:.2f}',
+                        'BB_Lower': '${:.2f}',
+                        'Stoch_%K': '{:.2f}',
+                        'Stoch_%D': '{:.2f}',
+                        'SMA_20': '${:.2f}',
+                        'EMA_12': '${:.2f}',
+                        'ATR': '{:.2f}',
+                        'ADX': '{:.2f}',
+                        '+DI': '{:.2f}',
+                        '-DI': '{:.2f}',
+                        'CCI': '{:.2f}',
+                        'Williams_%R': '{:.2f}'
+                    }), use_container_width=True)
+                    
+                    # PHÂN TÍCH XU HƯỚNG
+                    st.markdown("### 🎯 Phân tích xu hướng")
+                    
+                    # Xác định xu hướng dựa trên SMA
+                    trend_col1, trend_col2, trend_col3 = st.columns(3)
+                    
+                    with trend_col1:
+                        st.markdown("#### 📈 Xu hướng giá")
+                        
+                        if 'SMA_20' in df_view.columns and 'SMA_50' in df_view.columns:
+                            current_price = df_view['Close'].iloc[-1]
+                            sma20 = df_view['SMA_20'].iloc[-1]
+                            sma50 = df_view['SMA_50'].iloc[-1]
+                            sma200 = df_view['SMA_200'].iloc[-1] if 'SMA_200' in df_view.columns else None
+                            
+                            price_vs_sma20 = "Trên" if current_price > sma20 else "Dưới"
+                            price_vs_sma50 = "Trên" if current_price > sma50 else "Dưới"
+                            
+                            trend_short = "Tăng" if current_price > sma20 else "Giảm"
+                            trend_medium = "Tăng" if current_price > sma50 else "Giảm"
+                            trend_long = "Tăng" if sma200 and current_price > sma200 else "Giảm" if sma200 else "N/A"
+                            
+                            golden_cross = sma20 > sma50 and df_view['SMA_20'].iloc[-2] <= df_view['SMA_50'].iloc[-2]
+                            death_cross = sma20 < sma50 and df_view['SMA_20'].iloc[-2] >= df_view['SMA_50'].iloc[-2]
+                            
+                            st.markdown(f"**Giá hiện tại:** ${current_price:.2f}")
+                            st.markdown(f"**SMA 20:** ${sma20:.2f} ({price_vs_sma20})")
+                            st.markdown(f"**SMA 50:** ${sma50:.2f} ({price_vs_sma50})")
+                            if sma200:
+                                st.markdown(f"**SMA 200:** ${sma200:.2f}")
+                            
+                            st.markdown("**Xu hướng:**")
+                            st.markdown(f"• Ngắn hạn: **{trend_short}**")
+                            st.markdown(f"• Trung hạn: **{trend_medium}**")
+                            st.markdown(f"• Dài hạn: **{trend_long}**")
+                            
+                            if golden_cross:
+                                st.markdown("🔼 **Golden Cross** (SMA 20 vừa cắt lên SMA 50)")
+                            elif death_cross:
+                                st.markdown("🔽 **Death Cross** (SMA 20 vừa cắt xuống SMA 50)")
+                    
+                    with trend_col2:
+                        st.markdown("#### 📊 Chỉ báo động lượng")
+                        
+                        if 'RSI' in df_view.columns:
+                            current_rsi = df_view['RSI'].iloc[-1]
+                            rsi_signal = "Quá mua" if current_rsi > 70 else "Quá bán" if current_rsi < 30 else "Trung tính"
+                            rsi_color = "red" if current_rsi > 70 else "green" if current_rsi < 30 else "orange"
+                            
+                            st.markdown(f"**RSI (14):** {current_rsi:.2f}")
+                            st.markdown(f"<span style='color:{rsi_color}'>• {rsi_signal}</span>", unsafe_allow_html=True)
+                        
+                        if 'Stoch_%K' in df_view.columns:
+                            current_stoch_k = df_view['Stoch_%K'].iloc[-1]
+                            current_stoch_d = df_view['Stoch_%D'].iloc[-1]
+                            stoch_signal = "Quá mua" if current_stoch_k > 80 else "Quá bán" if current_stoch_k < 20 else "Trung tính"
+                            stoch_color = "red" if current_stoch_k > 80 else "green" if current_stoch_k < 20 else "orange"
+                            
+                            st.markdown(f"**Stochastic %K:** {current_stoch_k:.2f}")
+                            st.markdown(f"**Stochastic %D:** {current_stoch_d:.2f}")
+                            st.markdown(f"<span style='color:{stoch_color}'>• {stoch_signal}</span>", unsafe_allow_html=True)
+                        
+                        if 'MACD' in df_view.columns:
+                            current_macd = df_view['MACD'].iloc[-1]
+                            current_signal = df_view['Signal_Line'].iloc[-1]
+                            macd_hist = df_view['MACD_Histogram'].iloc[-1]
+                            
+                            macd_signal = "Tăng" if current_macd > current_signal else "Giảm"
+                            macd_color = "green" if current_macd > current_signal else "red"
+                            
+                            st.markdown(f"**MACD:** {current_macd:.4f}")
+                            st.markdown(f"**Signal Line:** {current_signal:.4f}")
+                            st.markdown(f"<span style='color:{macd_color}'>• Tín hiệu {macd_signal}</span>", unsafe_allow_html=True)
+                    
+                    with trend_col3:
+                        st.markdown("#### 🔍 Phân tích biến động")
+                        
+                        if 'ATR' in df_view.columns:
+                            current_atr = df_view['ATR'].iloc[-1]
+                            avg_price = df_view['Close'].mean()
+                            volatility = (current_atr / avg_price) * 100
+                            
+                            st.markdown(f"**ATR (14):** {current_atr:.2f}")
+                            st.markdown(f"**Biến động:** {volatility:.2f}%")
+                        
+                        if 'BB_Upper' in df_view.columns:
+                            current_price = df_view['Close'].iloc[-1]
+                            upper_band = df_view['BB_Upper'].iloc[-1]
+                            lower_band = df_view['BB_Lower'].iloc[-1]
+                            middle_band = df_view['BB_Middle'].iloc[-1]
+                            
+                            bb_width = (upper_band - lower_band) / middle_band
+                            
+                            bb_position = (current_price - lower_band) / (upper_band - lower_band) if upper_band != lower_band else 0.5
+                            
+                            bb_signal = "Gần dải trên - Có thể điều chỉnh" if bb_position > 0.8 else "Gần dải dưới - Có thể phục hồi" if bb_position < 0.2 else "Trong dải - Ổn định"
+                            
+                            st.markdown(f"**Bollinger Bands:**")
+                            st.markdown(f"• Upper: ${upper_band:.2f}")
+                            st.markdown(f"• Middle: ${middle_band:.2f}")
+                            st.markdown(f"• Lower: ${lower_band:.2f}")
+                            st.markdown(f"• Bandwidth: {bb_width:.4f}")
+                            st.markdown(f"• Position: {bb_position:.2f}")
+                            st.markdown(f"• {bb_signal}")
+                    
+                    # PHÂN TÍCH KHỐI LƯỢNG
+                    st.markdown("### 📊 Phân tích khối lượng giao dịch")
+                    
+                    vol_col1, vol_col2 = st.columns(2)
+                    
+                    with vol_col1:
+                        if 'Volume' in df_view.columns:
+                            current_volume = df_view['Volume'].iloc[-1]
+                            avg_volume_20 = df_view['Volume'].tail(20).mean()
+                            avg_volume_50 = df_view['Volume'].tail(50).mean()
+                            
+                            volume_ratio_20 = current_volume / avg_volume_20 if avg_volume_20 > 0 else 0
+                            volume_ratio_50 = current_volume / avg_volume_50 if avg_volume_50 > 0 else 0
+                            
+                            # Tính số ngày khối lượng tăng/giảm liên tiếp
+                            volume_changes = df_view['Volume'].diff().tail(10)
+                            consecutive_up = 0
+                            consecutive_down = 0
+                            
+                            for change in reversed(volume_changes):
+                                if change > 0:
+                                    consecutive_up += 1
+                                    consecutive_down = 0
+                                elif change < 0:
+                                    consecutive_down += 1
+                                    consecutive_up = 0
+                                else:
+                                    break
+                            
+                            st.markdown("#### 📊 Thống kê khối lượng")
+                            st.markdown(f"**Khối lượng hiện tại:** {current_volume:,.0f}")
+                            st.markdown(f"**Trung bình 20 ngày:** {avg_volume_20:,.0f}")
+                            st.markdown(f"**Trung bình 50 ngày:** {avg_volume_50:,.0f}")
+                            st.markdown(f"**Tỷ lệ so với TB 20 ngày:** {volume_ratio_20:.2f}x")
+                            st.markdown(f"**Tỷ lệ so với TB 50 ngày:** {volume_ratio_50:.2f}x")
+                            
+                            if consecutive_up > 0:
+                                st.markdown(f"**Khối lượng tăng liên tiếp:** {consecutive_up} ngày")
+                            elif consecutive_down > 0:
+                                st.markdown(f"**Khối lượng giảm liên tiếp:** {consecutive_down} ngày")
+                    
+                    with vol_col2:
+                        if 'Volume' in df_view.columns and 'Close' in df_view.columns:
+                            # Phân tích mối quan hệ giữa giá và khối lượng
+                            price_changes = df_view['Close'].pct_change().tail(10)
+                            volume_changes = df_view['Volume'].pct_change().tail(10)
+                            
+                            # Đếm số ngày giá tăng/giảm với khối lượng tăng/giảm
+                            price_up_vol_up = sum((price_changes > 0) & (volume_changes > 0))
+                            price_up_vol_down = sum((price_changes > 0) & (volume_changes < 0))
+                            price_down_vol_up = sum((price_changes < 0) & (volume_changes > 0))
+                            price_down_vol_down = sum((price_changes < 0) & (volume_changes < 0))
+                            
+                            # Phân tích ngày hiện tại
+                            current_price_change = price_changes.iloc[-1] if len(price_changes) > 0 else 0
+                            current_volume_change = volume_changes.iloc[-1] if len(volume_changes) > 0 else 0
+                            
+                            current_pattern = ""
+                            if current_price_change > 0 and current_volume_change > 0:
+                                current_pattern = "Giá tăng, Khối lượng tăng (Tín hiệu tăng mạnh)"
+                            elif current_price_change > 0 and current_volume_change < 0:
+                                current_pattern = "Giá tăng, Khối lượng giảm (Tín hiệu tăng yếu)"
+                            elif current_price_change < 0 and current_volume_change > 0:
+                                current_pattern = "Giá giảm, Khối lượng tăng (Tín hiệu giảm mạnh)"
+                            elif current_price_change < 0 and current_volume_change < 0:
+                                current_pattern = "Giá giảm, Khối lượng giảm (Tín hiệu giảm yếu)"
+                            
+                            st.markdown("#### 🔄 Mối quan hệ giá - khối lượng")
+                            st.markdown(f"**Ngày hiện tại:** {current_pattern}")
+                            st.markdown("**Thống kê 10 ngày gần đây:**")
+                            st.markdown(f"• Giá tăng, Khối lượng tăng: {price_up_vol_up} ngày")
+                            st.markdown(f"• Giá tăng, Khối lượng giảm: {price_up_vol_down} ngày")
+                            st.markdown(f"• Giá giảm, Khối lượng tăng: {price_down_vol_up} ngày")
+                            st.markdown(f"• Giá giảm, Khối lượng giảm: {price_down_vol_down} ngày")
+                    
+                    # KẾT LUẬN
+                    st.markdown("### 🎯 Kết luận phân tích kỹ thuật")
+                    
+                    # Tính điểm tổng hợp
+                    score = 0
+                    max_score = 0
+                    signals_summary = []
+                    
+                    # Phân tích xu hướng
+                    if 'SMA_20' in df_view.columns and 'SMA_50' in df_view.columns:
+                        current_price = df_view['Close'].iloc[-1]
+                        sma20 = df_view['SMA_20'].iloc[-1]
+                        sma50 = df_view['SMA_50'].iloc[-1]
+                        
+                        if current_price > sma20:
+                            score += 1
+                            signals_summary.append("Giá trên SMA 20 (Tích cực)")
+                        else:
+                            signals_summary.append("Giá dưới SMA 20 (Tiêu cực)")
+                        
+                        if current_price > sma50:
+                            score += 1
+                            signals_summary.append("Giá trên SMA 50 (Tích cực)")
+                        else:
+                            signals_summary.append("Giá dưới SMA 50 (Tiêu cực)")
+                        
+                        max_score += 2
+                    
+                    # Phân tích RSI
+                    if 'RSI' in df_view.columns:
+                        current_rsi = df_view['RSI'].iloc[-1]
+                        
+                        if current_rsi < 30:
+                            score += 1
+                            signals_summary.append("RSI quá bán (Cơ hội mua)")
+                        elif current_rsi > 70:
+                            signals_summary.append("RSI quá mua (Cảnh báo bán)")
+                        elif 30 <= current_rsi <= 50:
+                            score += 0.5
+                            signals_summary.append("RSI trong vùng trung tính thấp")
+                        elif 50 < current_rsi <= 70:
+                            score += 0.5
+                            signals_summary.append("RSI trong vùng trung tính cao")
+                        
+                        max_score += 1
+                    
+                    # Phân tích MACD
+                    if 'MACD' in df_view.columns and 'Signal_Line' in df_view.columns:
+                        current_macd = df_view['MACD'].iloc[-1]
+                        current_signal = df_view['Signal_Line'].iloc[-1]
+                        prev_macd = df_view['MACD'].iloc[-2]
+                        prev_signal = df_view['Signal_Line'].iloc[-2]
+                        
+                        if current_macd > current_signal:
+                            score += 1
+                            signals_summary.append("MACD trên Signal Line (Tích cực)")
+                        else:
+                            signals_summary.append("MACD dưới Signal Line (Tiêu cực)")
+                        
+                        # Phát hiện giao cắt
+                        if prev_macd <= prev_signal and current_macd > current_signal:
+                            score += 1
+                            signals_summary.append("MACD vừa cắt lên Signal Line (Tín hiệu mua)")
+                        elif prev_macd >= prev_signal and current_macd < current_signal:
+                            signals_summary.append("MACD vừa cắt xuống Signal Line (Tín hiệu bán)")
+                        
+                        max_score += 2
+                    
+                    # Phân tích Stochastic
+                    if 'Stoch_%K' in df_view.columns and 'Stoch_%D' in df_view.columns:
+                        current_k = df_view['Stoch_%K'].iloc[-1]
+                        current_d = df_view['Stoch_%D'].iloc[-1]
+                        prev_k = df_view['Stoch_%K'].iloc[-2]
+                        prev_d = df_view['Stoch_%D'].iloc[-2]
+                        
+                        if current_k < 20:
+                            score += 1
+                            signals_summary.append("Stochastic quá bán (Cơ hội mua)")
+                        elif current_k > 80:
+                            signals_summary.append("Stochastic quá mua (Cảnh báo bán)")
+                        
+                        # Phát hiện giao cắt
+                        if prev_k <= prev_d and current_k > current_d:
+                            score += 1
+                            signals_summary.append("Stochastic %K vừa cắt lên %D (Tín hiệu mua)")
+                        elif prev_k >= prev_d and current_k < current_d:
+                            signals_summary.append("Stochastic %K vừa cắt xuống %D (Tín hiệu bán)")
+                        
+                        max_score += 2
+                    
+                    # Phân tích Bollinger Bands
+                    if 'BB_Upper' in df_view.columns and 'BB_Lower' in df_view.columns:
+                        current_price = df_view['Close'].iloc[-1]
+                        upper_band = df_view['BB_Upper'].iloc[-1]
+                        lower_band = df_view['BB_Lower'].iloc[-1]
+                        
+                        if current_price <= lower_band:
+                            score += 1
+                            signals_summary.append("Giá chạm/dưới dải dưới Bollinger (Cơ hội mua)")
+                        elif current_price >= upper_band:
+                            signals_summary.append("Giá chạm/trên dải trên Bollinger (Cảnh báo bán)")
+                        
+                        max_score += 1
+                    
+                    # Phân tích khối lượng
+                    if 'Volume' in df_view.columns:
+                        current_volume = df_view['Volume'].iloc[-1]
+                        avg_volume = df_view['Volume'].tail(20).mean()
+                        
+                        if current_volume > avg_volume * 1.5:
+                            score += 1
+                            signals_summary.append("Khối lượng tăng mạnh (Xác nhận xu hướng)")
+                        
+                        max_score += 1
+                    
+                    # Tính điểm tổng hợp
+                    if max_score > 0:
+                        final_score = (score / max_score) * 10
+                    else:
+                        final_score = 5  # Điểm trung bình nếu không có đủ dữ liệu
+                    
+                    # Hiển thị kết luận
+                    conclusion_col1, conclusion_col2 = st.columns([1, 3])
+                    
+                    with conclusion_col1:
+                        # Hiển thị đồng hồ đo
+                        if final_score < 3:
+                            gauge_color = "red"
+                            sentiment = "Rất tiêu cực"
+                        elif final_score < 5:
+                            gauge_color = "orange"
+                            sentiment = "Tiêu cực"
+                        elif final_score < 6:
+                            gauge_color = "gray"
+                            sentiment = "Trung tính"
+                        elif final_score < 8:
+                            gauge_color = "lightgreen"
+                            sentiment = "Tích cực"
+                        else:
+                            gauge_color = "green"
+                            sentiment = "Rất tích cực"
+                        
+                        fig_gauge = go.Figure(go.Indicator(
+                            mode="gauge+number",
+                            value=final_score,
+                            domain={'x': [0, 1], 'y': [0, 1]},
+                            title={'text': "Điểm đánh giá kỹ thuật"},
+                            gauge={
+                                'axis': {'range': [0, 10]},
+                                'bar': {'color': gauge_color},
+                                'steps': [
+                                    {'range': [0, 3], 'color': "red"},
+                                    {'range': [3, 5], 'color': "orange"},
+                                    {'range': [5, 6], 'color': "gray"},
+                                    {'range': [6, 8], 'color': "lightgreen"},
+                                    {'range': [8, 10], 'color': "green"}
+                                ],
+                                'threshold': {
+                                    'line': {'color': "black", 'width': 4},
+                                    'thickness': 0.75,
+                                    'value': final_score
+                                }
+                            }
+                        ))
+                        
+                        fig_gauge.update_layout(height=300)
+                        st.plotly_chart(fig_gauge, use_container_width=True)
+                        
+                        st.markdown(f"**Đánh giá tổng thể:** {sentiment}")
+                    
+                    with conclusion_col2:
+                        st.markdown("#### 📝 Tóm tắt tín hiệu")
+                        
+                        for i, signal in enumerate(signals_summary):
+                            st.markdown(f"• {signal}")
+                        
+                        st.markdown("#### 🎯 Kết luận")
+                        
+                        if final_score >= 8:
+                            st.markdown("**Xu hướng tăng mạnh:** Các chỉ báo kỹ thuật cho thấy xu hướng tăng rõ rệt. Đây có thể là cơ hội mua vào.")
+                        elif final_score >= 6:
+                            st.markdown("**Xu hướng tăng nhẹ:** Phần lớn các chỉ báo kỹ thuật cho thấy tín hiệu tích cực. Có thể xem xét mua vào với khối lượng vừa phải.")
+                        elif final_score >= 5:
+                            st.markdown("**Xu hướng đi ngang:** Các chỉ báo kỹ thuật cho thấy tín hiệu trung tính. Nên theo dõi thêm trước khi đưa ra quyết định.")
+                        elif final_score >= 3:
+                            st.markdown("**Xu hướng giảm nhẹ:** Phần lớn các chỉ báo kỹ thuật cho thấy tín hiệu tiêu cực. Nên thận trọng và có thể xem xét giảm vị thế.")
+                        else:
+                            st.markdown("**Xu hướng giảm mạnh:** Các chỉ báo kỹ thuật cho thấy xu hướng giảm rõ rệt. Nên tránh mua vào và có thể xem xét bán ra.")
+                
             except Exception as e:
-                st.error(f"❌ Lỗi khi phân tích: {str(e)}")
+                st.error(f"Lỗi khi phân tích kỹ thuật: {str(e)}")
                 import traceback
                 st.code(traceback.format_exc())
-
-# FOOTER
-st.markdown("---")
-st.markdown("📊 **Phân Tích Thống Kê dự báo cổ phiếu của 3 cô nàng thư giãn**")
-
-# Thêm thông tin về các thư viện trong sidebar
-with st.sidebar:
-    st.markdown("---")
-    st.markdown("### '' Nắm bắt nhịp đập thị trường bằng góc nhìn vượt thời gian - Nơi ba con người tạo nên tương lai đầu tư '' ")
-    
-    st.markdown("---")
-    st.markdown("### 💡 Tips")
-    st.info("""
-    **Lưu ý khi dự báo:**
-    - Dự báo ngắn hạn (< 30 ngày) thường chính xác hơn
-    - Kết hợp nhiều mô hình để có cái nhìn tổng quan
-    - Chú ý các chỉ số MAPE, MAE, RMSE
-    - MAPE < 10%: Dự báo rất tốt
-    - MAPE 10-20%: Dự báo tốt
-    - MAPE > 50%: Dự báo kém
-    """)
